@@ -50,6 +50,7 @@ function App.new()
   self.changed_at = -1e9
   self.seen = -1
   self.stats = {}
+  self.peak_cache, self.peak_jobs, self.note_cache = {}, {}, {}
   return self
 end
 
@@ -67,8 +68,55 @@ end
 function App:set(k, v) self.cfg[k] = v; self:save(); self:refresh() end
 function App:refresh() self.pending = true; self.changed_at = -1e9 end
 
+---------------------------------------------------------------------------------------------------------- v0.2 view data
+-- waveform overview of a file: the table, false (not available), or nil (being prepared - ask again next frame)
+function App:peaks(file)
+  if not file or file == "" then return false end
+  local c = self.peak_cache[file]
+  if c ~= nil then return c end
+  if not self.peak_jobs[file] then
+    local h = RA.peaks_begin(file)
+    if not h then self.peak_cache[file] = false; return false end
+    self.peak_jobs[file] = h
+  end
+  return nil
+end
+
+-- let REAPER build peaks for a little while (called every frame from tick)
+function App:work_peaks(budget)
+  local t0 = r.time_precise()
+  for file, h in pairs(self.peak_jobs) do
+    local ok, ready = pcall(RA.peaks_step, h)
+    if not ok then self.peak_cache[file] = false; self.peak_jobs[file] = nil
+    elseif ready then
+      local ok2, ov = pcall(RA.peaks_read, h)
+      self.peak_cache[file] = ok2 and ov or false
+      self.peak_jobs[file] = nil
+    end
+    if r.time_precise() - t0 > (budget or 0.01) then break end
+  end
+end
+
+function App:notes(chunk)
+  if not chunk then return nil end
+  local c = self.note_cache[chunk]
+  if not c then c = C.midi_notes(chunk); self.note_cache[chunk] = c end
+  return c
+end
+
+-- idea-local playhead of card view c: the first (non-frozen) placement under the play position
+function App:playhead(c)
+  local p = RA.play_pos()
+  if not p or not c then return nil end
+  for _, pl in ipairs(c.places) do
+    if pl.kind ~= "frozen" and p >= pl.pos and p < pl.pos + pl.len then return p - pl.pos + (pl.offs or 0) end
+  end
+  return nil
+end
+
 ---------------------------------------------------------------------------------------------------------- tick
 function App:tick()
+  self:work_peaks(0.01)
   local cc = RA.change_count()
   local now = r.time_precise()
   if cc ~= self.seen then self.seen = cc; self.changed_at = now; self.pending = true end
@@ -653,6 +701,7 @@ function App:make_view(M)
     local G = M.cards[cid]
     local card = G.card
     local c = { cid = cid, name = card.name, color = card.color, active = card.active, match = card.match or false,
+                bpm = card.bpm or 120,
                 variants = {}, slots = {}, places = {}, auditions = 0, frozen = 0 }
     for _, vid in ipairs(self:variant_ids(card)) do
       local def = card.variants[vid]
@@ -661,7 +710,8 @@ function App:make_view(M)
         local s = card.slots[m.slot]
         members[#members + 1] = { mid = m.mid, slot = m.slot, track = s and s.name or "?", rel = m.rel, len = m.len,
                                   fin = m.fin or 0, fout = m.fout or 0, vol = m.vol or 1, mute = m.mute or 0,
-                                  midi = m.midi, measured = m.stats ~= nil }
+                                  midi = m.midi, measured = m.stats ~= nil, soffs = m.soffs or 0, rate = m.rate or 1,
+                                  file = m.file, notes = m.midi and self:notes(m.chunk) or nil }
       end
       c.variants[#c.variants + 1] = { vid = vid, name = def.name, len = C.def_extent(def), level = G.level[vid],
                                       cover = G.cover[vid] or 0, gain_db = C.lin_to_db(G.factor[vid] or 1),
@@ -681,7 +731,7 @@ function App:make_view(M)
         if kind == "audition" then c.auditions = c.auditions + 1 elseif kind == "frozen" then c.frozen = c.frozen + 1 end
         local count = P.count
         if not count then count = 0; for _ in pairs(P.members) do count = count + 1 end end
-        c.places[#c.places + 1] = { pid = pid, pos = P.W.pos, len = P.W.len, kind = kind, mixed = #reasons,
+        c.places[#c.places + 1] = { pid = pid, pos = P.W.pos, len = P.W.len, offs = P.W.offs, kind = kind, mixed = #reasons,
                                     reasons = reasons, members = count }
       end
     end
@@ -793,6 +843,7 @@ function App:stash(name, mode)
     local c = PALETTE[((tonumber(cid) - 1) % #PALETTE) + 1]
     local card = { id = cid, name = self:unique_name(pool, base), color = r.ColorToNative(c[1], c[2], c[3]), active = "1",
                    ref = "1", next_var = 2, next_pid = 1, match = false, slots = slots, map = {}, origin = P0,
+                   bpm = RA.tempo_at(P0),
                    variants = { ["1"] = { name = "A", members = members, next_mid = #members + 1, len = E - P0 } } }
     pool.cards[cid] = card
     pool.order[#pool.order + 1] = cid
@@ -1004,19 +1055,28 @@ function App:set_ref(cid, vid)
   end)
 end
 
--- numeric edit of one member of a variant (from the window): rel, len, fin, fout, vol (linear), mute
-function App:set_member(cid, vid, mid, field, value)
-  self:edit("edit idea", function(M)
+-- edit members of a variant from the window (numbers or a drag in the waveform view): one undo step.
+-- fields: rel, len, soffs, fin, fout, vol (linear), mute (bool)
+function App:set_member_fields(cid, vid, mid, fields, label)
+  self:edit(label or "edit idea", function(M)
     local G = M.cards[tostring(cid)]
     local def = G and G.card.variants[tostring(vid)]
     local m = def and C.member_by_mid(def, mid)
     if not m then return end
-    if field == "rel" then m.rel = math.max(0, value)
-    elseif field == "len" then m.len = math.max(0.001, value)
-    elseif field == "fin" or field == "fout" then m[field] = math.max(0, math.min(value, m.len))
-    elseif field == "vol" then m.vol = math.max(0, value)
-    elseif field == "mute" then m.mute = value and 1 or 0 end
+    local f = fields
+    if f.rel then m.rel = math.max(0, f.rel) end
+    if f.len then m.len = math.max(C.MIN_LEN, f.len) end
+    if f.soffs then m.soffs = f.soffs end
+    if f.vol then m.vol = math.max(0, f.vol) end
+    if f.mute ~= nil then m.mute = f.mute and 1 or 0 end
+    if f.fin then m.fin = math.max(0, math.min(f.fin, m.len)) end
+    if f.fout then m.fout = math.max(0, math.min(f.fout, m.len)) end
+    m.fin = math.min(m.fin or 0, m.len); m.fout = math.min(m.fout or 0, m.len)
   end)
+end
+
+function App:set_member(cid, vid, mid, field, value)
+  self:set_member_fields(cid, vid, mid, { [field] = value })
 end
 
 function App:rename(cid, name)

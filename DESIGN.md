@@ -1,4 +1,4 @@
-# IdeaPool design (v0.1.0)
+# IdeaPool design (v0.2.0)
 
 ## Model
 | IdeaPool | AliasTrack equivalent | Notes |
@@ -66,8 +66,19 @@ n-reaper-plugins/nlib            (own repo, own tests, tagged v0.x)
   checks that `vendor/nlib` matches the tag it claims.
 * Order: extract `window`, `json`, `chunk`, `theme` and the testkit first (used by both), `level` when GainStageEQ adopts it.
 
-## Limits in v0.1.0
-* No waveform view in the window (numeric editing only); peaks drawing is a 0.2 candidate.
+## The idea view (v0.2.0)
+* Pure geometry lives in `IPCore` and is tested: time <-> pixels, zoom range, grid step, snapping, hit zones
+  (fade handles, edges, gain edge, body), the effect of each drag on a member (limits: minimum length, file start and
+  end, fades never longer than the item), peak columns, the MIDI chunk parser and member-local notes.
+* Peaks: `PCM_Source_BuildPeaks` is stepped a little per frame from `tick` (10 ms budget), then the whole file is read
+  once at 200 peaks/s (channels folded) and cached per file. Columns are picked from that overview in source time, so
+  trims and playrate need no new reads. Files longer than 15 minutes show their first 15.
+* MIDI: notes come from the stored chunk (`HASDATA` ticks per QN, `E`/`e` events, `X` deltas counted), placed with
+  the tempo recorded at stash. Tempo changes inside an idea are not drawn.
+* A drag is previewed without writing anything; releasing it writes the def once (one undo step), and the sync
+  updates every linked placement.
+
+## Limits in v0.2.0
 * One active variant per idea for all linked placements (no per-placement variant pin yet).
 * Level ignores fades and take FX; MIDI items are not measured.
 * Frozen mode (freeze all) shows the pool but not MIXED states.
@@ -77,5 +88,6 @@ n-reaper-plugins/nlib            (own repo, own tests, tagged v0.x)
 2. **Solo audition** (hear an idea on its own, not in context): worth a hidden audition track, or is the marker enough?
 3. **Commit**: rename the marker to "(placed) …" (now), delete it, or leave it and just stop matching?
 4. **Tempo**: store ideas in beats and stretch on placing?
-5. **Waveform view** in the window for trims and fades: 0.2?
-6. **nlib extraction**: start right after IdeaPool's first real-REAPER test, or wait for a third plugin to need it?
+5. **Fade shapes**: the view draws linear fades; show REAPER's curve shapes, and let a right-click pick one?
+6. **Note editing** in the piano roll (move / add / delete), or keep it read-only and edit in placements?
+7. **nlib extraction**: start right after IdeaPool's first real-REAPER test, or wait for a third plugin to need it?

@@ -17,7 +17,7 @@ function M.install()
   local function tidx(t) for i, x in ipairs(S.tracks) do if x == t then return i end end end
 
   local function new_take(opts)
-    return { guid = guid(), name = opts.name or "", src = { file = opts.file or "", midi = opts.midi or false },
+    return { guid = guid(), name = opts.name or "", src = { file = opts.file or "", midi = opts.midi or false, events = opts.events },
              pool = opts.midi and guid() or nil, fx = opts.fx or {},
              p = { D_STARTOFFS = opts.soffs or 0, D_PLAYRATE = opts.rate or 1, D_PITCH = 0, D_VOL = 1 } }
   end
@@ -29,7 +29,7 @@ function M.install()
     return it
   end
   local function copy_take(tk, keep_pool)
-    local n = { guid = guid(), name = tk.name, src = { file = tk.src.file, midi = tk.src.midi },
+    local n = { guid = guid(), name = tk.name, src = { file = tk.src.file, midi = tk.src.midi, events = tk.src.events },
                 pool = keep_pool and tk.pool or (tk.src.midi and guid() or nil), fx = {}, p = {} }
     for k, v in pairs(tk.p) do n.p[k] = v end
     for i, f in ipairs(tk.fx) do n.fx[i] = f end
@@ -206,6 +206,33 @@ function M.install()
     return 1
   end
 
+  -- peaks: files are 10 s of constant amplitude; S.peak_steps[file] = build steps before peaks are ready
+  S.peak_steps = {}
+  R.PCM_Source_CreateFromFile = function(file) return { file = file, midi = false } end
+  R.PCM_Source_Destroy = function() end
+  R.GetMediaSourceLength = function() return 10, false end
+  R.PCM_Source_BuildPeaks = function(src, mode)
+    local n = S.peak_steps[src.file] or 0
+    if mode == 0 then return n > 0 and 1 or 0 end
+    if mode == 1 then n = math.max(0, n - 1); S.peak_steps[src.file] = n; return n end
+    return 0
+  end
+  R.PCM_Source_GetPeaks = function(src, rate, t0, nch, n, _, buf)
+    local a = S.amp[src.file] or 0.5
+    local got = 0
+    for i = 0, n - 1 do
+      local t = t0 + i / rate
+      if t >= 10 then break end
+      for c = 1, nch do buf.t[i * nch + c] = a; buf.t[n * nch + i * nch + c] = -a end
+      got = got + 1
+    end
+    return got
+  end
+  R.GetPlayState = function() return S.playing and 1 or 0 end
+  R.GetPlayPosition2 = function() return S.play_pos or 0 end
+  R.Master_GetTempo = function() return S.tempo or 120 end
+  R.TimeMap2_GetDividedBpmAtTime = function() return S.tempo or 120 end
+
   -- tracks
   R.CountTracks = function() return #S.tracks end
   R.GetTrack = function(_, i) return S.tracks[i + 1] end
@@ -302,8 +329,15 @@ function M.install()
     if tk then
       L[#L + 1] = "NAME \"" .. tk.name .. "\""
       L[#L + 1] = "GUID " .. tk.guid
-      L[#L + 1] = tk.src.midi and "SOURCE MIDI" or ("FILE \"" .. tk.src.file .. "\"")
-      if tk.pool then L[#L + 1] = "POOLEDEVTS " .. tk.pool end
+      if tk.src.midi then
+        L[#L + 1] = "<SOURCE MIDI"
+        L[#L + 1] = "HASDATA 1 960 QN"
+        if tk.pool then L[#L + 1] = "POOLEDEVTS " .. tk.pool end
+        for _, e in ipairs(tk.src.events or {}) do L[#L + 1] = e end
+        L[#L + 1] = ">"
+      else
+        L[#L + 1] = "FILE \"" .. tk.src.file .. "\""
+      end
       for _, f in ipairs(tk.fx) do L[#L + 1] = "FX " .. f.name; L[#L + 1] = "FXID " .. f.id end
     end
     L[#L + 1] = ">"
@@ -312,9 +346,13 @@ function M.install()
   R.SetItemStateChunk = function(it, chunk)
     local tk = { p = { D_STARTOFFS = 0, D_PLAYRATE = 1, D_PITCH = 0, D_VOL = 1 }, fx = {}, src = { file = "", midi = false }, name = "" }
     local fxname
+    local in_midi = false
     for line in chunk:gmatch("[^\n]+") do
       local k, v = line:match("^%s*(%u+)%s*(.*)$")
-      if k == "IGUID" then it.guid = v
+      if line:match("^%s*<SOURCE MIDI") then in_midi = true; tk.src.midi = true; tk.src.events = {}
+      elseif in_midi and line:match("^%s*>") then in_midi = false
+      elseif in_midi and line:match("^%s*[EeXx]%s") then table.insert(tk.src.events, (line:gsub("^%s+", "")))
+      elseif k == "IGUID" then it.guid = v
       elseif k == "POSITION" then it.p.D_POSITION = tonumber(v)
       elseif k == "LENGTH" then it.p.D_LENGTH = tonumber(v)
       elseif k == "NAME" then tk.name = v:match('^"(.*)"$') or v

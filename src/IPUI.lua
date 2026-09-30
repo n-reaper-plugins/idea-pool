@@ -3,6 +3,7 @@
 
 local r = reaper
 local V = require("IPVersion")
+local C = require("IPCore")
 
 local UI = {}
 
@@ -50,6 +51,15 @@ local function rgba(native)
 end
 
 local function db(x) return 20 * math.log(math.max(x, 1e-12), 10) end
+
+local function num(x, d) return type(x) == "number" and x or d end
+local function with_alpha(c, a) return (c & 0xFFFFFF00) | a end
+local NOTE_NAMES = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" }
+local function note_name(p) return NOTE_NAMES[p % 12 + 1] .. (p // 12 - 1) end
+
+local ROW_H, RULER_H, GUTTER, ROLL_H = 56, 18, 96, 170
+local COL_CANVAS, COL_ROW, COL_GRID, COL_TEXT = 0x101212FF, 0x1E2121FF, 0x2C3030FF, 0xB8B8B8FF
+local COL_SEL, COL_FADE, COL_PLAY, COL_WAVE = 0xFFFFFFFF, 0xFFCC44FF, 0x5FE07FFF, 0xE8E0FFFF
 
 function UI.new(app)
   local ui = {}
@@ -209,7 +219,7 @@ function UI.new(app)
       r.ImGui_PushID(ctx, k)
       r.ImGui_TableNextRow(ctx)
       r.ImGui_TableSetColumnIndex(ctx, 0)
-      r.ImGui_Text(ctx, m.track .. (m.midi and " (MIDI)" or "") .. (m.measured and "" or " *"))
+      r.ImGui_Text(ctx, (state.sel_mid == m.mid and "> " or "") .. m.track .. (m.midi and " (MIDI)" or "") .. (m.measured and "" or " *"))
       if not m.measured and not m.midi then tip("Not measured: press Measure on a placement.") end
       r.ImGui_TableSetColumnIndex(ctx, 1); num_field(k .. "rel", "##rel", m.rel, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "rel", x) end)
       r.ImGui_TableSetColumnIndex(ctx, 2); num_field(k .. "len", "##len", m.len, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "len", x) end)
@@ -272,6 +282,236 @@ function UI.new(app)
     r.ImGui_EndTable(ctx)
   end
 
+
+  ------------------------------------------------------------------------------------------------ v0.2: idea view
+  -- the active variant drawn like a tiny arrange view: one row per track, a waveform or notes per item.
+  -- Drag: body = move, edges = trim (left edge also moves the file offset, like REAPER), top corners = fades,
+  -- top edge = gain. One undo step per drag, applied to every linked placement.
+  state.zoom, state.scroll, state.snap = 1, 0, false
+
+  local function member_preview(m)
+    local d = state.drag
+    if not (d and d.mid == m.mid and d.fields) then return m end
+    return setmetatable(d.fields, { __index = m })
+  end
+
+  local function draw_view(c, v)
+    if state.view_cid ~= c.cid then                  -- another idea: selection, drag and zoom start fresh
+      state.view_cid, state.sel_mid, state.drag, state.zoom, state.scroll = c.cid, nil, nil, 1, 0
+    end
+    local dl = r.ImGui_GetWindowDrawList(ctx)
+    -- toolbar
+    if small("-##zoom_out", "Zoom out") then state.zoom = math.max(1, state.zoom / 1.5) end
+    r.ImGui_SameLine(ctx)
+    if small("+##zoom_in", "Zoom in") then state.zoom = math.min(64, state.zoom * 1.5) end
+    r.ImGui_SameLine(ctx)
+    if small("Fit##zoom_fit") then state.zoom, state.scroll = 1, 0 end
+    if state.zoom > 1 then
+      r.ImGui_SameLine(ctx)
+      r.ImGui_SetNextItemWidth(ctx, 160)
+      local ch, sv = r.ImGui_SliderDouble(ctx, "##scroll", state.scroll, 0, 1, "scroll")
+      if ch then state.scroll = sv end
+    end
+    r.ImGui_SameLine(ctx)
+    local ch, sn = r.ImGui_Checkbox(ctx, "Snap to 1/16##snap", state.snap)
+    if ch then state.snap = sn end
+    tip(string.format("Grid of 1/16 notes at %.1f BPM (the tempo where the idea was stashed).", c.bpm))
+
+    local aw = num(r.ImGui_GetContentRegionAvail(ctx), 600)
+    local w = math.max(240, aw)
+    local nrows = math.max(1, #c.slots)
+    local h = RULER_H + nrows * ROW_H
+    local x0, y0 = r.ImGui_GetCursorScreenPos(ctx)
+    x0, y0 = num(x0, 0), num(y0, 0)
+    r.ImGui_InvisibleButton(ctx, "##ideaview", w, h)
+    local hovered = r.ImGui_IsItemHovered(ctx)
+    local activated = r.ImGui_IsItemActivated(ctx)
+    local active = r.ImGui_IsItemActive(ctx)
+    local deactivated = r.ImGui_IsItemDeactivated(ctx)
+    local mx, my = r.ImGui_GetMousePos(ctx)
+    mx, my = num(mx, -1e9), num(my, -1e9)
+
+    local t0, t1 = C.view_range(v.len, state.zoom, state.scroll)
+    local vw = { x0 = x0 + GUTTER, w = w - GUTTER, t0 = t0, t1 = t1 }
+    local pps = vw.w / (t1 - t0)
+    local step = state.snap and (60 / c.bpm / 4) or nil
+
+    -- boxes (with the drag preview applied)
+    local boxes = {}
+    for _, m0 in ipairs(v.members) do
+      local m = member_preview(m0)
+      local row = math.max(1, math.min(nrows, m.slot or 1))
+      local by0 = y0 + RULER_H + (row - 1) * ROW_H + 3
+      local b = { m = m, m0 = m0, x0 = C.t2x(vw, m.rel), x1 = C.t2x(vw, m.rel + m.len), y0 = by0, y1 = by0 + ROW_H - 6,
+                  fin_px = (m.fin or 0) * pps, fout_px = (m.fout or 0) * pps }
+      boxes[#boxes + 1] = b
+    end
+
+    -- mouse
+    local function hit()
+      for i = #boxes, 1, -1 do
+        local z = C.hit_zone(boxes[i], mx, my)
+        if z then return boxes[i], z end
+      end
+    end
+    if activated then
+      local b, z = hit()
+      if b then
+        state.sel_mid = b.m0.mid
+        state.drag = { mid = b.m0.mid, kind = z, mx0 = mx, my0 = my }
+      else state.sel_mid = nil; state.drag = nil end
+    end
+    if state.drag and active then
+      local d = state.drag
+      local m0
+      for _, m in ipairs(v.members) do if m.mid == d.mid then m0 = m end end
+      if m0 then
+        local ov = (not m0.midi) and app:peaks(m0.file) or nil
+        d.moved = d.moved or math.abs(mx - d.mx0) > 2 or math.abs(my - d.my0) > 2
+        d.fields = d.moved and C.drag(m0, d.kind, (mx - d.mx0) / pps, my - d.my0, ov and ov.len or nil, step) or nil
+      end
+    end
+    if deactivated and state.drag then
+      local d = state.drag
+      state.drag = nil
+      if d.moved and d.fields and next(d.fields) then
+        app:set_member_fields(c.cid, v.vid, d.mid, d.fields, "drag in idea view")
+      end
+    end
+    if hovered and not active and r.ImGui_SetMouseCursor then
+      local _, z = hit()
+      if (z == "left" or z == "right") and r.ImGui_MouseCursor_ResizeEW then r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_ResizeEW())
+      elseif z == "gain" and r.ImGui_MouseCursor_ResizeNS then r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_ResizeNS())
+      elseif z and r.ImGui_MouseCursor_Hand then r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_Hand()) end
+    end
+
+    -- background, rows, grid
+    r.ImGui_DrawList_AddRectFilled(dl, x0, y0, x0 + w, y0 + h, COL_CANVAS)
+    for k = 1, nrows do
+      local ry = y0 + RULER_H + (k - 1) * ROW_H
+      r.ImGui_DrawList_AddRectFilled(dl, x0, ry + 1, x0 + w, ry + ROW_H - 1, COL_ROW)
+      local s = c.slots[k]
+      r.ImGui_DrawList_AddText(dl, x0 + 4, ry + 4, s and s.gone and COL_ERR or COL_TEXT, s and s.name or "?")
+    end
+    local gs = C.nice_step(pps)
+    local t = math.ceil(t0 / gs) * gs
+    while t <= t1 do
+      local x = C.t2x(vw, t)
+      r.ImGui_DrawList_AddLine(dl, x, y0 + RULER_H - 4, x, y0 + h, COL_GRID)
+      r.ImGui_DrawList_AddText(dl, x + 2, y0, COL_DIM, string.format(gs < 1 and "%.2f" or "%.0f s", t))
+      t = t + gs
+    end
+
+    -- items
+    local base = rgba(c.color)
+    for _, b in ipairs(boxes) do
+      local m = b.m
+      local cx0, cx1 = math.max(b.x0, vw.x0), math.min(b.x1, vw.x0 + vw.w)
+      if cx1 > cx0 then
+        local muted = (m.mute or 0) ~= 0
+        r.ImGui_DrawList_AddRectFilled(dl, cx0, b.y0, cx1, b.y1, with_alpha(base, muted and 0x28 or 0x55))
+        local mid_y, half = (b.y0 + b.y1) / 2, (b.y1 - b.y0) / 2 - 2
+        if m.midi then
+          local notes, lo, hi = C.member_notes(m.notes, m, c.bpm)
+          local nh = math.max(1, (b.y1 - b.y0 - 4) / (hi - lo + 1))
+          for _, n in ipairs(notes) do
+            local nx0, nx1 = C.t2x(vw, m.rel + n.a), C.t2x(vw, m.rel + n.b)
+            local ny = b.y1 - 2 - (n.pitch - lo + 1) * nh
+            if nx1 > cx0 and nx0 < cx1 then
+              r.ImGui_DrawList_AddRectFilled(dl, math.max(nx0, cx0), ny, math.min(math.max(nx1, nx0 + 1), cx1), ny + math.max(1, nh - 1),
+                with_alpha(COL_WAVE, muted and 0x50 or 0xD0))
+            end
+          end
+        else
+          local ov = app:peaks(m.file)
+          if ov == nil then
+            r.ImGui_DrawList_AddText(dl, cx0 + 4, mid_y - 7, COL_DIM, "reading peaks...")
+          elseif ov then
+            local ncol = math.max(1, math.min(1200, math.floor(b.x1 - b.x0)))
+            local cols = C.peak_columns(ov, m.soffs, m.len, m.rate, ncol)
+            local g = math.min(4, m.vol or 1)
+            for i, col in ipairs(cols) do
+              local x = b.x0 + (i - 0.5) * (b.x1 - b.x0) / ncol
+              if col and x >= cx0 and x <= cx1 then
+                local tl = (i - 0.5) / ncol * m.len                    -- fade envelope on the waveform
+                local f = 1
+                if (m.fin or 0) > 0 and tl < m.fin then f = tl / m.fin end
+                if (m.fout or 0) > 0 and tl > m.len - m.fout then f = math.min(f, (m.len - tl) / m.fout) end
+                local a, z = math.min(1, col[1] * g * f), math.max(-1, col[2] * g * f)
+                r.ImGui_DrawList_AddLine(dl, x, mid_y - a * half, x, mid_y - z * half, with_alpha(COL_WAVE, muted and 0x50 or 0xC0))
+              end
+            end
+          else
+            r.ImGui_DrawList_AddText(dl, cx0 + 4, mid_y - 7, COL_DIM, "no peaks")
+          end
+        end
+        -- fades and handles
+        if (m.fin or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x0, b.y1, b.x0 + b.fin_px, b.y0, COL_FADE, 1.5) end
+        if (m.fout or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x1 - b.fout_px, b.y0, b.x1, b.y1, COL_FADE, 1.5) end
+        r.ImGui_DrawList_AddRectFilled(dl, b.x0 + b.fin_px - 3, b.y0, b.x0 + b.fin_px + 3, b.y0 + 6, COL_FADE)
+        r.ImGui_DrawList_AddRectFilled(dl, b.x1 - b.fout_px - 3, b.y0, b.x1 - b.fout_px + 3, b.y0 + 6, COL_FADE)
+        local sel = state.sel_mid == b.m0.mid
+        r.ImGui_DrawList_AddRect(dl, cx0, b.y0, cx1, b.y1, sel and COL_SEL or with_alpha(base, 0xFF), 0, 0, sel and 2 or 1)
+        local label = string.format("%+.1f dB", db(m.vol or 1))
+        r.ImGui_DrawList_AddText(dl, cx0 + 3, b.y1 - 14, COL_TEXT, label)
+      end
+    end
+
+    -- playhead (the first placement of this idea under the play position)
+    local ph = app:playhead(c)
+    if ph and ph >= t0 and ph <= t1 then
+      local x = C.t2x(vw, ph)
+      r.ImGui_DrawList_AddLine(dl, x, y0, x, y0 + h, COL_PLAY, 1.5)
+    end
+
+    -- readout
+    if hovered or state.drag then
+      local b
+      if state.drag then for _, x in ipairs(boxes) do if x.m0.mid == state.drag.mid then b = x end end
+      else b = hit() end
+      if b and r.ImGui_SetTooltip then
+        local m = b.m
+        r.ImGui_SetTooltip(ctx, string.format("%s\nstart %.3f s   length %.3f s\nfade in %.3f   fade out %.3f   gain %+.1f dB",
+          b.m0.track, m.rel, m.len, m.fin or 0, m.fout or 0, db(m.vol or 1)))
+      end
+    end
+    ui.last_boxes, ui.last_view = boxes, vw           -- for the tests
+  end
+
+  -- larger read-only piano roll of the selected MIDI item
+  local function draw_roll(c, v)
+    local m
+    for _, x in ipairs(v.members) do if x.mid == state.sel_mid and x.midi then m = x end end
+    if not m then return end
+    local dl = r.ImGui_GetWindowDrawList(ctx)
+    r.ImGui_TextColored(ctx, COL_DIM, "Piano roll: " .. m.track .. " (read-only: edit notes in a placement; pooled placements share them, Save as variant keeps them in the idea)")
+    local w = math.max(240, num(r.ImGui_GetContentRegionAvail(ctx), 600))
+    local x0, y0 = r.ImGui_GetCursorScreenPos(ctx)
+    x0, y0 = num(x0, 0), num(y0, 0)
+    r.ImGui_Dummy(ctx, w, ROLL_H)
+    local notes, lo, hi = C.member_notes(m.notes, m, c.bpm)
+    lo, hi = math.max(0, lo - 2), math.min(127, hi + 2)
+    local vw = { x0 = x0 + 36, w = w - 36, t0 = 0, t1 = math.max(m.len, 0.01) }
+    local nh = ROLL_H / (hi - lo + 1)
+    r.ImGui_DrawList_AddRectFilled(dl, x0, y0, x0 + w, y0 + ROLL_H, COL_CANVAS)
+    for p = lo, hi do
+      local y = y0 + ROLL_H - (p - lo + 1) * nh
+      local black = ({ [1] = true, [3] = true, [6] = true, [8] = true, [10] = true })[p % 12]
+      if black then r.ImGui_DrawList_AddRectFilled(dl, vw.x0, y, x0 + w, y + nh, COL_ROW) end
+      if p % 12 == 0 then
+        r.ImGui_DrawList_AddLine(dl, vw.x0, y + nh, x0 + w, y + nh, COL_GRID)
+        r.ImGui_DrawList_AddText(dl, x0 + 2, y + nh - 13, COL_TEXT, note_name(p))
+      end
+    end
+    local base = rgba(c.color)
+    for _, n in ipairs(notes) do
+      local y = y0 + ROLL_H - (n.pitch - lo + 1) * nh
+      r.ImGui_DrawList_AddRectFilled(dl, C.t2x(vw, n.a), y + 1, math.max(C.t2x(vw, n.b), C.t2x(vw, n.a) + 2), y + nh - 1,
+        with_alpha(base, 0x60 + math.floor((n.vel or 100) / 127 * 0x9F)))
+    end
+    ui.last_roll = notes
+  end
+
   local function draw_detail()
     local c = app.selected and app:card_view(app.selected)
     if not c then return end
@@ -311,6 +551,8 @@ function UI.new(app)
     if ch then state.play = pl end
     r.ImGui_Spacing(ctx)
     local act = draw_variants(c)
+    r.ImGui_Spacing(ctx)
+    if act then draw_view(c, act); draw_roll(c, act) end
     r.ImGui_Spacing(ctx)
     draw_members(c, act)
     r.ImGui_Spacing(ctx)
@@ -361,7 +603,7 @@ function UI.new(app)
 
   function ui.frame()
     local pushed = push_theme(ctx)
-    r.ImGui_SetNextWindowSize(ctx, 1000, 700, r.ImGui_Cond_FirstUseEver())
+    r.ImGui_SetNextWindowSize(ctx, 1000, 820, r.ImGui_Cond_FirstUseEver())
     local visible, open = r.ImGui_Begin(ctx, title, true)
     if visible then
       local ok, e = pcall(draw_ui)

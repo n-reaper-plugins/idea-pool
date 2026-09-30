@@ -1,4 +1,6 @@
-# IdeaPool v0.1.0 – an ideas pool for REAPER
+# IdeaPool v0.2.0 – an ideas pool for REAPER
+
+![image](screenshot.png)
 
 One action (`IdeaPool.lua`) opens a ReaImGui window. **Stash** selected items (any tracks) as an *idea*, keep
 **variants** of it, **place** it back as linked copies, and **audition** it anywhere in the song with a marker.
@@ -41,6 +43,23 @@ now (e.g. a frozen one you reworked) into a new active variant. Items can also b
 (start, length, fades, gain, mute).
 **Match loudness between variants** plays every variant at the level of the *reference* variant (gated average, like
 GainStageEQ), so switching compares the sound, not the volume. The real volumes are kept; turning matching off restores them.
+
+## The idea view (v0.2)
+The active variant is drawn like a small arrange view: one row per track, each item with its **waveform** (read from
+REAPER's peaks of the file, prepared in the background) or, for MIDI, its **notes**. Edit with the mouse:
+
+| Drag | Does |
+|---|---|
+| the body | move the item inside the idea |
+| the left / right edge | trim (the left edge also moves the file offset, like REAPER; it stops at the file's start and end) |
+| the small handles in the top corners | fade in / fade out |
+| the top edge | gain (4 px per dB, up = louder) |
+
+Every drag is **one undo step** and reaches every linked placement. **Snap to 1/16** uses the tempo where the idea was
+stashed. **− / + / Fit** and the scroll slider zoom; the green line is the playhead while a placement of the idea plays.
+Hovering shows start, length, fades and gain. Clicking a **MIDI** item opens a larger, read-only **piano roll** (edit
+notes in a placement: pooled placements share them, **Save as variant** keeps them in the idea).
+The table below the view still takes exact numbers.
 
 ## Audition in context (markers)
 Name a marker like an idea (case and spaces ignored – the PrototypeSequence rule; optional prefix such as `idea:`):

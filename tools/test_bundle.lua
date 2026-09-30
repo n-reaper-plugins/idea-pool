@@ -16,7 +16,7 @@ local ok, err = pcall(assert(loadfile("dist/IdeaPool.lua")))
 T.ok(ok, "bundle runs: " .. tostring(err))
 T.ok(deferred ~= nil, "main loop scheduled")
 local src = io.open("dist/IdeaPool.lua"):read("*a")
-T.ok(src:find("@version 0.1.0", 1, true) ~= nil, "version stamped"); T.ok(not src:find("@@VERSION@@", 1, true), "no placeholder")
+T.ok(src:find("@version 0.2.0", 1, true) ~= nil, "version stamped"); T.ok(not src:find("@@VERSION@@", 1, true), "no placeholder")
 T.ok(src:find("copied from AliasTrack", 1, true) ~= nil, "copied core says where it comes from")
 
 local function frames(n) for _ = 1, n do S.clock = S.clock + 1; local d = deferred; deferred = nil; local ok2, e = pcall(d); T.ok(ok2, "frame: " .. tostring(e)) end end

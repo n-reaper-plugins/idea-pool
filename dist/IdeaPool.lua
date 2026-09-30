@@ -1,15 +1,15 @@
 -- @description IdeaPool: stash items as ideas, keep variants, place them as linked copies, audition them at markers
--- @version 0.1.0
+-- @version 0.2.0
 -- @author _n_plugins
 -- @about
 --   Select items (any tracks) and stash them as an idea. Ideas keep variants (A, B, ...) with optional loudness matching,
 --   are placed back as linked placements on an IDEAS track (edit one, all follow; freeze or detach any), and a marker
 --   named like an idea auditions it right there in the song. Everything is stored in the project.
 --   Needs ReaImGui (ReaPack > ReaTeam Extensions). Run the action again while the window is open to close it.
--- BUNDLED BUILD of IdeaPool v0.1.0 - edit the files in src/, not this one.
+-- BUNDLED BUILD of IdeaPool v0.2.0 - edit the files in src/, not this one.
 local __preload = package.preload
 __preload["IPVersion"] = function(...)
-return { VERSION = "0.1.0" }
+return { VERSION = "0.2.0" }
 
 end
 __preload["IPCore"] = function(...)
@@ -603,6 +603,165 @@ function C.map_slots(origin_idx, target, ntracks, n)
   return out
 end
 
+----------------------------------------------------------------------------- v0.2: waveform / piano-roll view
+-- Everything the view needs that is not drawing: time <-> pixels, which part of a member the mouse is on, what a drag
+-- does to a member, peak columns for a waveform, notes for a piano roll, grid lines.
+
+-- view = { x0, w, t0, t1 }: x0/w in pixels, t0..t1 = the visible idea-local time
+function C.t2x(v, t) return v.x0 + (t - v.t0) / (v.t1 - v.t0) * v.w end
+function C.x2t(v, x) return v.t0 + (x - v.x0) / v.w * (v.t1 - v.t0) end
+
+-- visible range for a zoom factor (1 = fit) and a scroll position 0..1
+function C.view_range(len, zoom, scroll)
+  len = math.max(len or 0, 0.1) * 1.05
+  zoom = math.max(1, zoom or 1)
+  local span = len / zoom
+  local t0 = (len - span) * math.max(0, math.min(1, scroll or 0))
+  return t0, t0 + span
+end
+
+-- a "nice" grid step for about `px_per_s` pixels per second (at least ~60 px between lines)
+function C.nice_step(px_per_s)
+  local want = 60 / math.max(px_per_s, 1e-6)
+  for _, s in ipairs({ 0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300 }) do
+    if s >= want then return s end
+  end
+  return 600
+end
+
+function C.snap(t, step) if not step or step <= 0 then return t end return math.floor(t / step + 0.5) * step end
+
+-- box = { x0, y0, x1, y1, fin_px, fout_px }: where is (mx, my)? -> "fin" | "fout" | "gain" | "left" | "right" | "move" | nil
+C.EDGE_PX, C.HANDLE_PX = 5, 8
+function C.hit_zone(box, mx, my)
+  if mx < box.x0 - 2 or mx > box.x1 + 2 or my < box.y0 - 2 or my > box.y1 + 2 then return nil end
+  local near_top = my <= box.y0 + C.HANDLE_PX
+  if near_top and mx <= box.x0 + math.max(C.HANDLE_PX, box.fin_px or 0) + 2 and mx <= (box.x0 + box.x1) / 2 then return "fin" end
+  if near_top and mx >= box.x1 - math.max(C.HANDLE_PX, box.fout_px or 0) - 2 and mx > (box.x0 + box.x1) / 2 then return "fout" end
+  if mx <= box.x0 + C.EDGE_PX then return "left" end
+  if mx >= box.x1 - C.EDGE_PX then return "right" end
+  if near_top then return "gain" end
+  return "move"
+end
+
+-- what a drag does. m = member (rel, len, soffs, rate, fin, fout, vol, midi), dt = seconds, dy = pixels (down = +),
+-- srclen = source length (nil = unknown / MIDI), step = snap step (nil = off). Returns the changed fields only.
+C.MIN_LEN = 0.01
+function C.drag(m, kind, dt, dy, srclen, step)
+  local rate = m.rate or 1
+  local rel, len, soffs = m.rel, m.len, m.soffs or 0
+  if kind == "move" then
+    return { rel = math.max(0, C.snap(rel + dt, step)) }
+  elseif kind == "left" then
+    local nrel = C.snap(rel + dt, step)
+    local d = nrel - rel
+    d = math.min(d, len - C.MIN_LEN)                        -- keep some length
+    if not m.midi then d = math.max(d, -soffs / rate) end    -- not before the start of the file
+    d = math.max(d, -rel)                                    -- not before the idea's start
+    local nlen = len - d
+    return { rel = rel + d, len = nlen, soffs = soffs + d * rate,
+             fin = math.min(m.fin or 0, nlen), fout = math.min(m.fout or 0, nlen) }
+  elseif kind == "right" then
+    local e = C.snap(rel + len + dt, step)
+    local nlen = math.max(C.MIN_LEN, e - rel)
+    if srclen and not m.midi then nlen = math.min(nlen, (srclen - soffs) / rate) end
+    return { len = nlen, fin = math.min(m.fin or 0, nlen), fout = math.min(m.fout or 0, nlen) }
+  elseif kind == "fin" then
+    return { fin = math.max(0, math.min((m.fin or 0) + dt, len - (m.fout or 0))) }
+  elseif kind == "fout" then
+    return { fout = math.max(0, math.min((m.fout or 0) - dt, len - (m.fin or 0))) }
+  elseif kind == "gain" then
+    local db = C.lin_to_db(m.vol or 1) - (dy or 0) * 0.25          -- 4 px per dB, drag up = louder
+    db = math.max(-60, math.min(24, db))
+    return { vol = C.db_to_lin(db) }
+  end
+  return {}
+end
+
+-- peak columns for the part of a source a member shows. ov = { rate = peaks per second, mx = {}, mn = {} } in source
+-- time; the member shows source time soffs .. soffs + len * playrate. Returns n columns { mx, mn } (nil = no data).
+function C.peak_columns(ov, soffs, len, rate, n)
+  local out = {}
+  if not ov or not ov.mx or n < 1 then return out end
+  local s0, s1 = soffs or 0, (soffs or 0) + len * (rate or 1)
+  for i = 1, n do
+    local a = s0 + (s1 - s0) * (i - 1) / n
+    local b = s0 + (s1 - s0) * i / n
+    local k0 = math.floor(a * ov.rate) + 1
+    local k1 = math.max(k0, math.ceil(b * ov.rate))
+    local mx, mn
+    for k = k0, k1 do
+      local x, y = ov.mx[k], ov.mn[k]
+      if x then mx = mx and math.max(mx, x) or x end
+      if y then mn = mn and math.min(mn, y) or y end
+    end
+    out[i] = mx and { mx, mn or -mx } or false
+  end
+  return out
+end
+
+-- notes of a MIDI item chunk (REAPER's text format: HASDATA 1 <ticks per QN> QN, then E/e/X/x <delta> ...).
+-- Returns { tpq, notes = { { s = start QN, e = end QN, pitch, vel } } }; notes still on at the end are closed there.
+function C.midi_notes(chunk)
+  local tpq = 960
+  local notes, on, ticks = {}, {}, 0
+  local in_src = false
+  for line in (chunk or ""):gmatch("[^\n]+") do
+    local l = line:match("^%s*(.-)%s*$")
+    if l:match("^<SOURCE MIDI") then in_src = true
+    elseif in_src then
+      local t = l:match("^HASDATA%s+%d+%s+(%d+)")
+      if t then tpq = tonumber(t) end
+      local kind, d, st, a, b = l:match("^([EeXx])m?%s+(%d+)%s+(%x+)%s*(%x*)%s*(%x*)")
+      if kind then
+        ticks = ticks + tonumber(d)
+        if kind == "E" or kind == "e" then
+          local status = tonumber(st, 16) or 0
+          local hi, ch = status & 0xF0, status & 0x0F
+          local p, v = tonumber(a, 16), tonumber(b, 16)
+          if p then
+            local key = ch * 128 + p
+            if hi == 0x90 and v and v > 0 then
+              on[key] = on[key] or {}
+              table.insert(on[key], { s = ticks, vel = v })
+            elseif hi == 0x80 or (hi == 0x90 and v == 0) then
+              local list = on[key]
+              if list and #list > 0 then
+                local n = table.remove(list, 1)
+                notes[#notes + 1] = { s = n.s, e = ticks, pitch = p, vel = n.vel }
+              end
+            end
+          end
+        end
+      elseif l == ">" then in_src = false end
+    end
+  end
+  for key, list in pairs(on) do
+    for _, n in ipairs(list) do notes[#notes + 1] = { s = n.s, e = ticks, pitch = key % 128, vel = n.vel } end
+  end
+  for _, n in ipairs(notes) do n.s = n.s / tpq; n.e = n.e / tpq end
+  table.sort(notes, function(x, y) if x.s ~= y.s then return x.s < y.s end return x.pitch < y.pitch end)
+  return { tpq = tpq, notes = notes }
+end
+
+-- notes of member m in member-local seconds (MIDI take offset in seconds, constant tempo bpm), clipped to the member,
+-- plus the pitch range to draw
+function C.member_notes(parsed, m, bpm)
+  local spq = 60 / (bpm or 120)
+  local out, lo, hi = {}, 127, 0
+  for _, n in ipairs(parsed and parsed.notes or {}) do
+    local a = n.s * spq - (m.soffs or 0)
+    local b = n.e * spq - (m.soffs or 0)
+    if b > 0 and a < m.len then
+      out[#out + 1] = { a = math.max(0, a), b = math.min(m.len, b), pitch = n.pitch, vel = n.vel }
+      lo = math.min(lo, n.pitch); hi = math.max(hi, n.pitch)
+    end
+  end
+  if #out == 0 then lo, hi = 60, 72 end
+  if hi - lo < 12 then local c = (hi + lo) / 2; lo, hi = math.floor(c - 6), math.ceil(c + 6) end
+  return out, lo, hi
+end
+
 return C
 
 end
@@ -888,6 +1047,68 @@ function RA.measure(it)
   return { s0 = r.GetMediaItemTakeInfo_Value(tk, "D_STARTOFFS"), rate = r.GetMediaItemTakeInfo_Value(tk, "D_PLAYRATE"), fr = fr }
 end
 
+---------------------------------------------------------------------------------------------------------- peaks (v0.2)
+-- A waveform overview of a whole file: RATE peaks per second of source time, channels folded (max of maxima, min of
+-- minima). REAPER may have to build its .reapeaks first: begin, then step (a little per frame) until done, then read.
+RA.PEAK_RATE, RA.PEAK_MAX_LEN = 200, 900          -- peaks/s, seconds of file at most
+
+function RA.peaks_begin(file)
+  if not file or file == "" then return nil end
+  local src = r.PCM_Source_CreateFromFile(file)
+  if not src then return nil end
+  local need = r.PCM_Source_BuildPeaks(src, 0)
+  return { src = src, file = file, building = need ~= 0 }
+end
+
+-- true when the peaks are ready to read
+function RA.peaks_step(h)
+  if not h.building then return true end
+  if r.PCM_Source_BuildPeaks(h.src, 1) == 0 then r.PCM_Source_BuildPeaks(h.src, 2); h.building = false; return true end
+  return false
+end
+
+function RA.peaks_read(h)
+  local src = h.src
+  local flen = math.min(r.GetMediaSourceLength(src) or 0, RA.PEAK_MAX_LEN)
+  local nch = math.max(1, math.min(2, r.GetMediaSourceNumChannels(src) or 1))
+  local total = math.max(1, math.floor(flen * RA.PEAK_RATE))
+  local CH = 4096
+  local buf = r.new_array(CH * nch * 2)
+  local mx, mn = {}, {}
+  local done = 0
+  while done < total do
+    local n = math.min(CH, total - done)
+    buf.clear()
+    local ret = r.PCM_Source_GetPeaks(src, RA.PEAK_RATE, done / RA.PEAK_RATE, nch, n, 0, buf)
+    local got = math.min(n, (ret or 0) & 0xFFFFF)
+    local t = buf.table()
+    for i = 0, got - 1 do
+      local a, b = -1e9, 1e9
+      for c = 1, nch do
+        local x, y = t[i * nch + c] or 0, t[n * nch + i * nch + c] or 0
+        if x > a then a = x end
+        if y < b then b = y end
+      end
+      mx[done + i + 1], mn[done + i + 1] = a, b
+    end
+    if got < n then break end
+    done = done + n
+  end
+  r.PCM_Source_Destroy(src)
+  h.src = nil
+  return { rate = RA.PEAK_RATE, mx = mx, mn = mn, len = flen }
+end
+
+function RA.play_pos()
+  if (r.GetPlayState() & 1) == 1 then return r.GetPlayPosition2() end
+  return nil
+end
+
+function RA.tempo_at(pos)
+  if r.TimeMap2_GetDividedBpmAtTime then return r.TimeMap2_GetDividedBpmAtTime(0, pos) end
+  return r.Master_GetTempo()
+end
+
 ---------------------------------------------------------------------------------------------------------- misc
 function RA.cursor() return r.GetCursorPosition() end
 function RA.set_cursor(pos) r.SetEditCurPos(pos, true, false) end
@@ -960,6 +1181,7 @@ function App.new()
   self.changed_at = -1e9
   self.seen = -1
   self.stats = {}
+  self.peak_cache, self.peak_jobs, self.note_cache = {}, {}, {}
   return self
 end
 
@@ -977,8 +1199,55 @@ end
 function App:set(k, v) self.cfg[k] = v; self:save(); self:refresh() end
 function App:refresh() self.pending = true; self.changed_at = -1e9 end
 
+---------------------------------------------------------------------------------------------------------- v0.2 view data
+-- waveform overview of a file: the table, false (not available), or nil (being prepared - ask again next frame)
+function App:peaks(file)
+  if not file or file == "" then return false end
+  local c = self.peak_cache[file]
+  if c ~= nil then return c end
+  if not self.peak_jobs[file] then
+    local h = RA.peaks_begin(file)
+    if not h then self.peak_cache[file] = false; return false end
+    self.peak_jobs[file] = h
+  end
+  return nil
+end
+
+-- let REAPER build peaks for a little while (called every frame from tick)
+function App:work_peaks(budget)
+  local t0 = r.time_precise()
+  for file, h in pairs(self.peak_jobs) do
+    local ok, ready = pcall(RA.peaks_step, h)
+    if not ok then self.peak_cache[file] = false; self.peak_jobs[file] = nil
+    elseif ready then
+      local ok2, ov = pcall(RA.peaks_read, h)
+      self.peak_cache[file] = ok2 and ov or false
+      self.peak_jobs[file] = nil
+    end
+    if r.time_precise() - t0 > (budget or 0.01) then break end
+  end
+end
+
+function App:notes(chunk)
+  if not chunk then return nil end
+  local c = self.note_cache[chunk]
+  if not c then c = C.midi_notes(chunk); self.note_cache[chunk] = c end
+  return c
+end
+
+-- idea-local playhead of card view c: the first (non-frozen) placement under the play position
+function App:playhead(c)
+  local p = RA.play_pos()
+  if not p or not c then return nil end
+  for _, pl in ipairs(c.places) do
+    if pl.kind ~= "frozen" and p >= pl.pos and p < pl.pos + pl.len then return p - pl.pos + (pl.offs or 0) end
+  end
+  return nil
+end
+
 ---------------------------------------------------------------------------------------------------------- tick
 function App:tick()
+  self:work_peaks(0.01)
   local cc = RA.change_count()
   local now = r.time_precise()
   if cc ~= self.seen then self.seen = cc; self.changed_at = now; self.pending = true end
@@ -1563,6 +1832,7 @@ function App:make_view(M)
     local G = M.cards[cid]
     local card = G.card
     local c = { cid = cid, name = card.name, color = card.color, active = card.active, match = card.match or false,
+                bpm = card.bpm or 120,
                 variants = {}, slots = {}, places = {}, auditions = 0, frozen = 0 }
     for _, vid in ipairs(self:variant_ids(card)) do
       local def = card.variants[vid]
@@ -1571,7 +1841,8 @@ function App:make_view(M)
         local s = card.slots[m.slot]
         members[#members + 1] = { mid = m.mid, slot = m.slot, track = s and s.name or "?", rel = m.rel, len = m.len,
                                   fin = m.fin or 0, fout = m.fout or 0, vol = m.vol or 1, mute = m.mute or 0,
-                                  midi = m.midi, measured = m.stats ~= nil }
+                                  midi = m.midi, measured = m.stats ~= nil, soffs = m.soffs or 0, rate = m.rate or 1,
+                                  file = m.file, notes = m.midi and self:notes(m.chunk) or nil }
       end
       c.variants[#c.variants + 1] = { vid = vid, name = def.name, len = C.def_extent(def), level = G.level[vid],
                                       cover = G.cover[vid] or 0, gain_db = C.lin_to_db(G.factor[vid] or 1),
@@ -1591,7 +1862,7 @@ function App:make_view(M)
         if kind == "audition" then c.auditions = c.auditions + 1 elseif kind == "frozen" then c.frozen = c.frozen + 1 end
         local count = P.count
         if not count then count = 0; for _ in pairs(P.members) do count = count + 1 end end
-        c.places[#c.places + 1] = { pid = pid, pos = P.W.pos, len = P.W.len, kind = kind, mixed = #reasons,
+        c.places[#c.places + 1] = { pid = pid, pos = P.W.pos, len = P.W.len, offs = P.W.offs, kind = kind, mixed = #reasons,
                                     reasons = reasons, members = count }
       end
     end
@@ -1703,6 +1974,7 @@ function App:stash(name, mode)
     local c = PALETTE[((tonumber(cid) - 1) % #PALETTE) + 1]
     local card = { id = cid, name = self:unique_name(pool, base), color = r.ColorToNative(c[1], c[2], c[3]), active = "1",
                    ref = "1", next_var = 2, next_pid = 1, match = false, slots = slots, map = {}, origin = P0,
+                   bpm = RA.tempo_at(P0),
                    variants = { ["1"] = { name = "A", members = members, next_mid = #members + 1, len = E - P0 } } }
     pool.cards[cid] = card
     pool.order[#pool.order + 1] = cid
@@ -1914,19 +2186,28 @@ function App:set_ref(cid, vid)
   end)
 end
 
--- numeric edit of one member of a variant (from the window): rel, len, fin, fout, vol (linear), mute
-function App:set_member(cid, vid, mid, field, value)
-  self:edit("edit idea", function(M)
+-- edit members of a variant from the window (numbers or a drag in the waveform view): one undo step.
+-- fields: rel, len, soffs, fin, fout, vol (linear), mute (bool)
+function App:set_member_fields(cid, vid, mid, fields, label)
+  self:edit(label or "edit idea", function(M)
     local G = M.cards[tostring(cid)]
     local def = G and G.card.variants[tostring(vid)]
     local m = def and C.member_by_mid(def, mid)
     if not m then return end
-    if field == "rel" then m.rel = math.max(0, value)
-    elseif field == "len" then m.len = math.max(0.001, value)
-    elseif field == "fin" or field == "fout" then m[field] = math.max(0, math.min(value, m.len))
-    elseif field == "vol" then m.vol = math.max(0, value)
-    elseif field == "mute" then m.mute = value and 1 or 0 end
+    local f = fields
+    if f.rel then m.rel = math.max(0, f.rel) end
+    if f.len then m.len = math.max(C.MIN_LEN, f.len) end
+    if f.soffs then m.soffs = f.soffs end
+    if f.vol then m.vol = math.max(0, f.vol) end
+    if f.mute ~= nil then m.mute = f.mute and 1 or 0 end
+    if f.fin then m.fin = math.max(0, math.min(f.fin, m.len)) end
+    if f.fout then m.fout = math.max(0, math.min(f.fout, m.len)) end
+    m.fin = math.min(m.fin or 0, m.len); m.fout = math.min(m.fout or 0, m.len)
   end)
+end
+
+function App:set_member(cid, vid, mid, field, value)
+  self:set_member_fields(cid, vid, mid, { [field] = value })
 end
 
 function App:rename(cid, name)
@@ -2016,6 +2297,7 @@ __preload["IPUI"] = function(...)
 
 local r = reaper
 local V = require("IPVersion")
+local C = require("IPCore")
 
 local UI = {}
 
@@ -2063,6 +2345,15 @@ local function rgba(native)
 end
 
 local function db(x) return 20 * math.log(math.max(x, 1e-12), 10) end
+
+local function num(x, d) return type(x) == "number" and x or d end
+local function with_alpha(c, a) return (c & 0xFFFFFF00) | a end
+local NOTE_NAMES = { "C", "C#", "D", "D#", "E", "F", "F#", "G", "G#", "A", "A#", "B" }
+local function note_name(p) return NOTE_NAMES[p % 12 + 1] .. (p // 12 - 1) end
+
+local ROW_H, RULER_H, GUTTER, ROLL_H = 56, 18, 96, 170
+local COL_CANVAS, COL_ROW, COL_GRID, COL_TEXT = 0x101212FF, 0x1E2121FF, 0x2C3030FF, 0xB8B8B8FF
+local COL_SEL, COL_FADE, COL_PLAY, COL_WAVE = 0xFFFFFFFF, 0xFFCC44FF, 0x5FE07FFF, 0xE8E0FFFF
 
 function UI.new(app)
   local ui = {}
@@ -2222,7 +2513,7 @@ function UI.new(app)
       r.ImGui_PushID(ctx, k)
       r.ImGui_TableNextRow(ctx)
       r.ImGui_TableSetColumnIndex(ctx, 0)
-      r.ImGui_Text(ctx, m.track .. (m.midi and " (MIDI)" or "") .. (m.measured and "" or " *"))
+      r.ImGui_Text(ctx, (state.sel_mid == m.mid and "> " or "") .. m.track .. (m.midi and " (MIDI)" or "") .. (m.measured and "" or " *"))
       if not m.measured and not m.midi then tip("Not measured: press Measure on a placement.") end
       r.ImGui_TableSetColumnIndex(ctx, 1); num_field(k .. "rel", "##rel", m.rel, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "rel", x) end)
       r.ImGui_TableSetColumnIndex(ctx, 2); num_field(k .. "len", "##len", m.len, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "len", x) end)
@@ -2285,6 +2576,236 @@ function UI.new(app)
     r.ImGui_EndTable(ctx)
   end
 
+
+  ------------------------------------------------------------------------------------------------ v0.2: idea view
+  -- the active variant drawn like a tiny arrange view: one row per track, a waveform or notes per item.
+  -- Drag: body = move, edges = trim (left edge also moves the file offset, like REAPER), top corners = fades,
+  -- top edge = gain. One undo step per drag, applied to every linked placement.
+  state.zoom, state.scroll, state.snap = 1, 0, false
+
+  local function member_preview(m)
+    local d = state.drag
+    if not (d and d.mid == m.mid and d.fields) then return m end
+    return setmetatable(d.fields, { __index = m })
+  end
+
+  local function draw_view(c, v)
+    if state.view_cid ~= c.cid then                  -- another idea: selection, drag and zoom start fresh
+      state.view_cid, state.sel_mid, state.drag, state.zoom, state.scroll = c.cid, nil, nil, 1, 0
+    end
+    local dl = r.ImGui_GetWindowDrawList(ctx)
+    -- toolbar
+    if small("-##zoom_out", "Zoom out") then state.zoom = math.max(1, state.zoom / 1.5) end
+    r.ImGui_SameLine(ctx)
+    if small("+##zoom_in", "Zoom in") then state.zoom = math.min(64, state.zoom * 1.5) end
+    r.ImGui_SameLine(ctx)
+    if small("Fit##zoom_fit") then state.zoom, state.scroll = 1, 0 end
+    if state.zoom > 1 then
+      r.ImGui_SameLine(ctx)
+      r.ImGui_SetNextItemWidth(ctx, 160)
+      local ch, sv = r.ImGui_SliderDouble(ctx, "##scroll", state.scroll, 0, 1, "scroll")
+      if ch then state.scroll = sv end
+    end
+    r.ImGui_SameLine(ctx)
+    local ch, sn = r.ImGui_Checkbox(ctx, "Snap to 1/16##snap", state.snap)
+    if ch then state.snap = sn end
+    tip(string.format("Grid of 1/16 notes at %.1f BPM (the tempo where the idea was stashed).", c.bpm))
+
+    local aw = num(r.ImGui_GetContentRegionAvail(ctx), 600)
+    local w = math.max(240, aw)
+    local nrows = math.max(1, #c.slots)
+    local h = RULER_H + nrows * ROW_H
+    local x0, y0 = r.ImGui_GetCursorScreenPos(ctx)
+    x0, y0 = num(x0, 0), num(y0, 0)
+    r.ImGui_InvisibleButton(ctx, "##ideaview", w, h)
+    local hovered = r.ImGui_IsItemHovered(ctx)
+    local activated = r.ImGui_IsItemActivated(ctx)
+    local active = r.ImGui_IsItemActive(ctx)
+    local deactivated = r.ImGui_IsItemDeactivated(ctx)
+    local mx, my = r.ImGui_GetMousePos(ctx)
+    mx, my = num(mx, -1e9), num(my, -1e9)
+
+    local t0, t1 = C.view_range(v.len, state.zoom, state.scroll)
+    local vw = { x0 = x0 + GUTTER, w = w - GUTTER, t0 = t0, t1 = t1 }
+    local pps = vw.w / (t1 - t0)
+    local step = state.snap and (60 / c.bpm / 4) or nil
+
+    -- boxes (with the drag preview applied)
+    local boxes = {}
+    for _, m0 in ipairs(v.members) do
+      local m = member_preview(m0)
+      local row = math.max(1, math.min(nrows, m.slot or 1))
+      local by0 = y0 + RULER_H + (row - 1) * ROW_H + 3
+      local b = { m = m, m0 = m0, x0 = C.t2x(vw, m.rel), x1 = C.t2x(vw, m.rel + m.len), y0 = by0, y1 = by0 + ROW_H - 6,
+                  fin_px = (m.fin or 0) * pps, fout_px = (m.fout or 0) * pps }
+      boxes[#boxes + 1] = b
+    end
+
+    -- mouse
+    local function hit()
+      for i = #boxes, 1, -1 do
+        local z = C.hit_zone(boxes[i], mx, my)
+        if z then return boxes[i], z end
+      end
+    end
+    if activated then
+      local b, z = hit()
+      if b then
+        state.sel_mid = b.m0.mid
+        state.drag = { mid = b.m0.mid, kind = z, mx0 = mx, my0 = my }
+      else state.sel_mid = nil; state.drag = nil end
+    end
+    if state.drag and active then
+      local d = state.drag
+      local m0
+      for _, m in ipairs(v.members) do if m.mid == d.mid then m0 = m end end
+      if m0 then
+        local ov = (not m0.midi) and app:peaks(m0.file) or nil
+        d.moved = d.moved or math.abs(mx - d.mx0) > 2 or math.abs(my - d.my0) > 2
+        d.fields = d.moved and C.drag(m0, d.kind, (mx - d.mx0) / pps, my - d.my0, ov and ov.len or nil, step) or nil
+      end
+    end
+    if deactivated and state.drag then
+      local d = state.drag
+      state.drag = nil
+      if d.moved and d.fields and next(d.fields) then
+        app:set_member_fields(c.cid, v.vid, d.mid, d.fields, "drag in idea view")
+      end
+    end
+    if hovered and not active and r.ImGui_SetMouseCursor then
+      local _, z = hit()
+      if (z == "left" or z == "right") and r.ImGui_MouseCursor_ResizeEW then r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_ResizeEW())
+      elseif z == "gain" and r.ImGui_MouseCursor_ResizeNS then r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_ResizeNS())
+      elseif z and r.ImGui_MouseCursor_Hand then r.ImGui_SetMouseCursor(ctx, r.ImGui_MouseCursor_Hand()) end
+    end
+
+    -- background, rows, grid
+    r.ImGui_DrawList_AddRectFilled(dl, x0, y0, x0 + w, y0 + h, COL_CANVAS)
+    for k = 1, nrows do
+      local ry = y0 + RULER_H + (k - 1) * ROW_H
+      r.ImGui_DrawList_AddRectFilled(dl, x0, ry + 1, x0 + w, ry + ROW_H - 1, COL_ROW)
+      local s = c.slots[k]
+      r.ImGui_DrawList_AddText(dl, x0 + 4, ry + 4, s and s.gone and COL_ERR or COL_TEXT, s and s.name or "?")
+    end
+    local gs = C.nice_step(pps)
+    local t = math.ceil(t0 / gs) * gs
+    while t <= t1 do
+      local x = C.t2x(vw, t)
+      r.ImGui_DrawList_AddLine(dl, x, y0 + RULER_H - 4, x, y0 + h, COL_GRID)
+      r.ImGui_DrawList_AddText(dl, x + 2, y0, COL_DIM, string.format(gs < 1 and "%.2f" or "%.0f s", t))
+      t = t + gs
+    end
+
+    -- items
+    local base = rgba(c.color)
+    for _, b in ipairs(boxes) do
+      local m = b.m
+      local cx0, cx1 = math.max(b.x0, vw.x0), math.min(b.x1, vw.x0 + vw.w)
+      if cx1 > cx0 then
+        local muted = (m.mute or 0) ~= 0
+        r.ImGui_DrawList_AddRectFilled(dl, cx0, b.y0, cx1, b.y1, with_alpha(base, muted and 0x28 or 0x55))
+        local mid_y, half = (b.y0 + b.y1) / 2, (b.y1 - b.y0) / 2 - 2
+        if m.midi then
+          local notes, lo, hi = C.member_notes(m.notes, m, c.bpm)
+          local nh = math.max(1, (b.y1 - b.y0 - 4) / (hi - lo + 1))
+          for _, n in ipairs(notes) do
+            local nx0, nx1 = C.t2x(vw, m.rel + n.a), C.t2x(vw, m.rel + n.b)
+            local ny = b.y1 - 2 - (n.pitch - lo + 1) * nh
+            if nx1 > cx0 and nx0 < cx1 then
+              r.ImGui_DrawList_AddRectFilled(dl, math.max(nx0, cx0), ny, math.min(math.max(nx1, nx0 + 1), cx1), ny + math.max(1, nh - 1),
+                with_alpha(COL_WAVE, muted and 0x50 or 0xD0))
+            end
+          end
+        else
+          local ov = app:peaks(m.file)
+          if ov == nil then
+            r.ImGui_DrawList_AddText(dl, cx0 + 4, mid_y - 7, COL_DIM, "reading peaks...")
+          elseif ov then
+            local ncol = math.max(1, math.min(1200, math.floor(b.x1 - b.x0)))
+            local cols = C.peak_columns(ov, m.soffs, m.len, m.rate, ncol)
+            local g = math.min(4, m.vol or 1)
+            for i, col in ipairs(cols) do
+              local x = b.x0 + (i - 0.5) * (b.x1 - b.x0) / ncol
+              if col and x >= cx0 and x <= cx1 then
+                local tl = (i - 0.5) / ncol * m.len                    -- fade envelope on the waveform
+                local f = 1
+                if (m.fin or 0) > 0 and tl < m.fin then f = tl / m.fin end
+                if (m.fout or 0) > 0 and tl > m.len - m.fout then f = math.min(f, (m.len - tl) / m.fout) end
+                local a, z = math.min(1, col[1] * g * f), math.max(-1, col[2] * g * f)
+                r.ImGui_DrawList_AddLine(dl, x, mid_y - a * half, x, mid_y - z * half, with_alpha(COL_WAVE, muted and 0x50 or 0xC0))
+              end
+            end
+          else
+            r.ImGui_DrawList_AddText(dl, cx0 + 4, mid_y - 7, COL_DIM, "no peaks")
+          end
+        end
+        -- fades and handles
+        if (m.fin or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x0, b.y1, b.x0 + b.fin_px, b.y0, COL_FADE, 1.5) end
+        if (m.fout or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x1 - b.fout_px, b.y0, b.x1, b.y1, COL_FADE, 1.5) end
+        r.ImGui_DrawList_AddRectFilled(dl, b.x0 + b.fin_px - 3, b.y0, b.x0 + b.fin_px + 3, b.y0 + 6, COL_FADE)
+        r.ImGui_DrawList_AddRectFilled(dl, b.x1 - b.fout_px - 3, b.y0, b.x1 - b.fout_px + 3, b.y0 + 6, COL_FADE)
+        local sel = state.sel_mid == b.m0.mid
+        r.ImGui_DrawList_AddRect(dl, cx0, b.y0, cx1, b.y1, sel and COL_SEL or with_alpha(base, 0xFF), 0, 0, sel and 2 or 1)
+        local label = string.format("%+.1f dB", db(m.vol or 1))
+        r.ImGui_DrawList_AddText(dl, cx0 + 3, b.y1 - 14, COL_TEXT, label)
+      end
+    end
+
+    -- playhead (the first placement of this idea under the play position)
+    local ph = app:playhead(c)
+    if ph and ph >= t0 and ph <= t1 then
+      local x = C.t2x(vw, ph)
+      r.ImGui_DrawList_AddLine(dl, x, y0, x, y0 + h, COL_PLAY, 1.5)
+    end
+
+    -- readout
+    if hovered or state.drag then
+      local b
+      if state.drag then for _, x in ipairs(boxes) do if x.m0.mid == state.drag.mid then b = x end end
+      else b = hit() end
+      if b and r.ImGui_SetTooltip then
+        local m = b.m
+        r.ImGui_SetTooltip(ctx, string.format("%s\nstart %.3f s   length %.3f s\nfade in %.3f   fade out %.3f   gain %+.1f dB",
+          b.m0.track, m.rel, m.len, m.fin or 0, m.fout or 0, db(m.vol or 1)))
+      end
+    end
+    ui.last_boxes, ui.last_view = boxes, vw           -- for the tests
+  end
+
+  -- larger read-only piano roll of the selected MIDI item
+  local function draw_roll(c, v)
+    local m
+    for _, x in ipairs(v.members) do if x.mid == state.sel_mid and x.midi then m = x end end
+    if not m then return end
+    local dl = r.ImGui_GetWindowDrawList(ctx)
+    r.ImGui_TextColored(ctx, COL_DIM, "Piano roll: " .. m.track .. " (read-only: edit notes in a placement; pooled placements share them, Save as variant keeps them in the idea)")
+    local w = math.max(240, num(r.ImGui_GetContentRegionAvail(ctx), 600))
+    local x0, y0 = r.ImGui_GetCursorScreenPos(ctx)
+    x0, y0 = num(x0, 0), num(y0, 0)
+    r.ImGui_Dummy(ctx, w, ROLL_H)
+    local notes, lo, hi = C.member_notes(m.notes, m, c.bpm)
+    lo, hi = math.max(0, lo - 2), math.min(127, hi + 2)
+    local vw = { x0 = x0 + 36, w = w - 36, t0 = 0, t1 = math.max(m.len, 0.01) }
+    local nh = ROLL_H / (hi - lo + 1)
+    r.ImGui_DrawList_AddRectFilled(dl, x0, y0, x0 + w, y0 + ROLL_H, COL_CANVAS)
+    for p = lo, hi do
+      local y = y0 + ROLL_H - (p - lo + 1) * nh
+      local black = ({ [1] = true, [3] = true, [6] = true, [8] = true, [10] = true })[p % 12]
+      if black then r.ImGui_DrawList_AddRectFilled(dl, vw.x0, y, x0 + w, y + nh, COL_ROW) end
+      if p % 12 == 0 then
+        r.ImGui_DrawList_AddLine(dl, vw.x0, y + nh, x0 + w, y + nh, COL_GRID)
+        r.ImGui_DrawList_AddText(dl, x0 + 2, y + nh - 13, COL_TEXT, note_name(p))
+      end
+    end
+    local base = rgba(c.color)
+    for _, n in ipairs(notes) do
+      local y = y0 + ROLL_H - (n.pitch - lo + 1) * nh
+      r.ImGui_DrawList_AddRectFilled(dl, C.t2x(vw, n.a), y + 1, math.max(C.t2x(vw, n.b), C.t2x(vw, n.a) + 2), y + nh - 1,
+        with_alpha(base, 0x60 + math.floor((n.vel or 100) / 127 * 0x9F)))
+    end
+    ui.last_roll = notes
+  end
+
   local function draw_detail()
     local c = app.selected and app:card_view(app.selected)
     if not c then return end
@@ -2324,6 +2845,8 @@ function UI.new(app)
     if ch then state.play = pl end
     r.ImGui_Spacing(ctx)
     local act = draw_variants(c)
+    r.ImGui_Spacing(ctx)
+    if act then draw_view(c, act); draw_roll(c, act) end
     r.ImGui_Spacing(ctx)
     draw_members(c, act)
     r.ImGui_Spacing(ctx)
@@ -2374,7 +2897,7 @@ function UI.new(app)
 
   function ui.frame()
     local pushed = push_theme(ctx)
-    r.ImGui_SetNextWindowSize(ctx, 1000, 700, r.ImGui_Cond_FirstUseEver())
+    r.ImGui_SetNextWindowSize(ctx, 1000, 820, r.ImGui_Cond_FirstUseEver())
     local visible, open = r.ImGui_Begin(ctx, title, true)
     if visible then
       local ok, e = pcall(draw_ui)

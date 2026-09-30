@@ -279,4 +279,55 @@ do
   T.ok(R.lane.ext.IP_lane == nil and #R.app.view.cards == 0, "detach all forgets the pool")
 end
 
+------------------------------------------------------------------------------------------------ v0.2: view data
+do
+  local P = fresh(); Mock.S.tempo = 96
+  stash(P, "Riff", "remove")
+  Mock.S.cursor = 30; P.app:place(P.cid, "cursor")
+  Mock.S.cursor = 40; P.app:place(P.cid, "cursor")
+  local c = card(P)
+  T.eq(c.bpm, 96, "the tempo where the idea was stashed is kept (for the grid and MIDI)")
+  local m = c.variants[1].members[1]
+  T.eq(m.file, "/s/riff.wav", "view knows the file"); T.eq(m.soffs, 0, "and the offset"); T.eq(m.rate, 1, "and the rate")
+  T.eq(c.places[1].offs, 0, "placements carry their window offset")
+
+  -- a drag = several fields in one undo step, applied to every placement
+  local before = #Mock.S.undo
+  P.app:set_member_fields(P.cid, c.variants[1].vid, m.mid, { rel = 0.5, len = 1.5, soffs = 0.5 }, "drag in idea view")
+  T.eq(#Mock.S.undo, before + 1, "one undo step"); T.eq(Mock.S.undo[#Mock.S.undo], "IdeaPool: drag in idea view", "labelled")
+  local g = at(P.gtr, 30.5)
+  T.ok(g and approx(g.p.D_LENGTH, 1.5) and approx(g.takes[1].p.D_STARTOFFS, 0.5), "left trim reaches placement 1 (start, length, offset)")
+  T.ok(at(P.gtr, 40.5) ~= nil, "and placement 2")
+  P.app:set_member_fields(P.cid, c.variants[1].vid, m.mid, { fin = 5 })
+  T.ok(approx(at(P.gtr, 30.5).p.D_FADEINLEN, 1.5), "fades are limited to the item length")
+
+  -- peaks: prepared over a few frames, then cached
+  Mock.S.peak_steps["/s/riff.wav"] = 2
+  T.ok(P.app:peaks("/s/riff.wav") == nil, "peaks not ready at first")
+  P.app:work_peaks(1); T.ok(P.app:peaks("/s/riff.wav") == nil, "still building")
+  P.app:work_peaks(1)
+  local ov = P.app:peaks("/s/riff.wav")
+  T.ok(ov and ov.rate == 200 and #ov.mx == 2000, "overview: 10 s at 200 peaks/s")
+  T.ok(approx(ov.mx[1], 0.5) and approx(ov.mn[1], -0.5), "peak values")
+  T.ok(P.app:peaks("/s/riff.wav") == ov, "cached")
+  T.eq(P.app:peaks(""), false, "no file = no peaks")
+
+  -- playhead
+  Mock.S.playing, Mock.S.play_pos = true, 41
+  T.ok(approx(P.app:playhead(card(P)), 1), "playhead in idea time, from the placement under the play position")
+  Mock.S.play_pos = 99; T.ok(P.app:playhead(card(P)) == nil, "no placement there: no playhead")
+  Mock.S.playing = false
+
+  -- MIDI ideas bring their notes
+  local Q = fresh()
+  local mi = Mock.item(Q.keys, 5, 2, nil, { midi = true, name = "chords", events = { "E 0 90 3c 64", "E 960 80 3c 00" } })
+  Mock.select({ mi }); local cid = Q.app:stash("Chords")
+  local mm = Q.app:card_view(cid).variants[1].members[1]
+  T.ok(mm.midi and mm.notes and #mm.notes.notes == 1, "the view has the MIDI notes of the stored item")
+  T.eq(mm.notes.notes[1].pitch, 60, "C4")
+  Mock.S.cursor = 20; Q.app:place(cid, "cursor")
+  local placed = at(Q.keys, 20)
+  T.ok(placed and #placed.takes[1].src.events == 2, "placed MIDI carries its notes")
+end
+
 T.done("test_sync")

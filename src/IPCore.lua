@@ -588,4 +588,163 @@ function C.map_slots(origin_idx, target, ntracks, n)
   return out
 end
 
+----------------------------------------------------------------------------- v0.2: waveform / piano-roll view
+-- Everything the view needs that is not drawing: time <-> pixels, which part of a member the mouse is on, what a drag
+-- does to a member, peak columns for a waveform, notes for a piano roll, grid lines.
+
+-- view = { x0, w, t0, t1 }: x0/w in pixels, t0..t1 = the visible idea-local time
+function C.t2x(v, t) return v.x0 + (t - v.t0) / (v.t1 - v.t0) * v.w end
+function C.x2t(v, x) return v.t0 + (x - v.x0) / v.w * (v.t1 - v.t0) end
+
+-- visible range for a zoom factor (1 = fit) and a scroll position 0..1
+function C.view_range(len, zoom, scroll)
+  len = math.max(len or 0, 0.1) * 1.05
+  zoom = math.max(1, zoom or 1)
+  local span = len / zoom
+  local t0 = (len - span) * math.max(0, math.min(1, scroll or 0))
+  return t0, t0 + span
+end
+
+-- a "nice" grid step for about `px_per_s` pixels per second (at least ~60 px between lines)
+function C.nice_step(px_per_s)
+  local want = 60 / math.max(px_per_s, 1e-6)
+  for _, s in ipairs({ 0.01, 0.02, 0.05, 0.1, 0.2, 0.25, 0.5, 1, 2, 5, 10, 15, 30, 60, 120, 300 }) do
+    if s >= want then return s end
+  end
+  return 600
+end
+
+function C.snap(t, step) if not step or step <= 0 then return t end return math.floor(t / step + 0.5) * step end
+
+-- box = { x0, y0, x1, y1, fin_px, fout_px }: where is (mx, my)? -> "fin" | "fout" | "gain" | "left" | "right" | "move" | nil
+C.EDGE_PX, C.HANDLE_PX = 5, 8
+function C.hit_zone(box, mx, my)
+  if mx < box.x0 - 2 or mx > box.x1 + 2 or my < box.y0 - 2 or my > box.y1 + 2 then return nil end
+  local near_top = my <= box.y0 + C.HANDLE_PX
+  if near_top and mx <= box.x0 + math.max(C.HANDLE_PX, box.fin_px or 0) + 2 and mx <= (box.x0 + box.x1) / 2 then return "fin" end
+  if near_top and mx >= box.x1 - math.max(C.HANDLE_PX, box.fout_px or 0) - 2 and mx > (box.x0 + box.x1) / 2 then return "fout" end
+  if mx <= box.x0 + C.EDGE_PX then return "left" end
+  if mx >= box.x1 - C.EDGE_PX then return "right" end
+  if near_top then return "gain" end
+  return "move"
+end
+
+-- what a drag does. m = member (rel, len, soffs, rate, fin, fout, vol, midi), dt = seconds, dy = pixels (down = +),
+-- srclen = source length (nil = unknown / MIDI), step = snap step (nil = off). Returns the changed fields only.
+C.MIN_LEN = 0.01
+function C.drag(m, kind, dt, dy, srclen, step)
+  local rate = m.rate or 1
+  local rel, len, soffs = m.rel, m.len, m.soffs or 0
+  if kind == "move" then
+    return { rel = math.max(0, C.snap(rel + dt, step)) }
+  elseif kind == "left" then
+    local nrel = C.snap(rel + dt, step)
+    local d = nrel - rel
+    d = math.min(d, len - C.MIN_LEN)                        -- keep some length
+    if not m.midi then d = math.max(d, -soffs / rate) end    -- not before the start of the file
+    d = math.max(d, -rel)                                    -- not before the idea's start
+    local nlen = len - d
+    return { rel = rel + d, len = nlen, soffs = soffs + d * rate,
+             fin = math.min(m.fin or 0, nlen), fout = math.min(m.fout or 0, nlen) }
+  elseif kind == "right" then
+    local e = C.snap(rel + len + dt, step)
+    local nlen = math.max(C.MIN_LEN, e - rel)
+    if srclen and not m.midi then nlen = math.min(nlen, (srclen - soffs) / rate) end
+    return { len = nlen, fin = math.min(m.fin or 0, nlen), fout = math.min(m.fout or 0, nlen) }
+  elseif kind == "fin" then
+    return { fin = math.max(0, math.min((m.fin or 0) + dt, len - (m.fout or 0))) }
+  elseif kind == "fout" then
+    return { fout = math.max(0, math.min((m.fout or 0) - dt, len - (m.fin or 0))) }
+  elseif kind == "gain" then
+    local db = C.lin_to_db(m.vol or 1) - (dy or 0) * 0.25          -- 4 px per dB, drag up = louder
+    db = math.max(-60, math.min(24, db))
+    return { vol = C.db_to_lin(db) }
+  end
+  return {}
+end
+
+-- peak columns for the part of a source a member shows. ov = { rate = peaks per second, mx = {}, mn = {} } in source
+-- time; the member shows source time soffs .. soffs + len * playrate. Returns n columns { mx, mn } (nil = no data).
+function C.peak_columns(ov, soffs, len, rate, n)
+  local out = {}
+  if not ov or not ov.mx or n < 1 then return out end
+  local s0, s1 = soffs or 0, (soffs or 0) + len * (rate or 1)
+  for i = 1, n do
+    local a = s0 + (s1 - s0) * (i - 1) / n
+    local b = s0 + (s1 - s0) * i / n
+    local k0 = math.floor(a * ov.rate) + 1
+    local k1 = math.max(k0, math.ceil(b * ov.rate))
+    local mx, mn
+    for k = k0, k1 do
+      local x, y = ov.mx[k], ov.mn[k]
+      if x then mx = mx and math.max(mx, x) or x end
+      if y then mn = mn and math.min(mn, y) or y end
+    end
+    out[i] = mx and { mx, mn or -mx } or false
+  end
+  return out
+end
+
+-- notes of a MIDI item chunk (REAPER's text format: HASDATA 1 <ticks per QN> QN, then E/e/X/x <delta> ...).
+-- Returns { tpq, notes = { { s = start QN, e = end QN, pitch, vel } } }; notes still on at the end are closed there.
+function C.midi_notes(chunk)
+  local tpq = 960
+  local notes, on, ticks = {}, {}, 0
+  local in_src = false
+  for line in (chunk or ""):gmatch("[^\n]+") do
+    local l = line:match("^%s*(.-)%s*$")
+    if l:match("^<SOURCE MIDI") then in_src = true
+    elseif in_src then
+      local t = l:match("^HASDATA%s+%d+%s+(%d+)")
+      if t then tpq = tonumber(t) end
+      local kind, d, st, a, b = l:match("^([EeXx])m?%s+(%d+)%s+(%x+)%s*(%x*)%s*(%x*)")
+      if kind then
+        ticks = ticks + tonumber(d)
+        if kind == "E" or kind == "e" then
+          local status = tonumber(st, 16) or 0
+          local hi, ch = status & 0xF0, status & 0x0F
+          local p, v = tonumber(a, 16), tonumber(b, 16)
+          if p then
+            local key = ch * 128 + p
+            if hi == 0x90 and v and v > 0 then
+              on[key] = on[key] or {}
+              table.insert(on[key], { s = ticks, vel = v })
+            elseif hi == 0x80 or (hi == 0x90 and v == 0) then
+              local list = on[key]
+              if list and #list > 0 then
+                local n = table.remove(list, 1)
+                notes[#notes + 1] = { s = n.s, e = ticks, pitch = p, vel = n.vel }
+              end
+            end
+          end
+        end
+      elseif l == ">" then in_src = false end
+    end
+  end
+  for key, list in pairs(on) do
+    for _, n in ipairs(list) do notes[#notes + 1] = { s = n.s, e = ticks, pitch = key % 128, vel = n.vel } end
+  end
+  for _, n in ipairs(notes) do n.s = n.s / tpq; n.e = n.e / tpq end
+  table.sort(notes, function(x, y) if x.s ~= y.s then return x.s < y.s end return x.pitch < y.pitch end)
+  return { tpq = tpq, notes = notes }
+end
+
+-- notes of member m in member-local seconds (MIDI take offset in seconds, constant tempo bpm), clipped to the member,
+-- plus the pitch range to draw
+function C.member_notes(parsed, m, bpm)
+  local spq = 60 / (bpm or 120)
+  local out, lo, hi = {}, 127, 0
+  for _, n in ipairs(parsed and parsed.notes or {}) do
+    local a = n.s * spq - (m.soffs or 0)
+    local b = n.e * spq - (m.soffs or 0)
+    if b > 0 and a < m.len then
+      out[#out + 1] = { a = math.max(0, a), b = math.min(m.len, b), pitch = n.pitch, vel = n.vel }
+      lo = math.min(lo, n.pitch); hi = math.max(hi, n.pitch)
+    end
+  end
+  if #out == 0 then lo, hi = 60, 72 end
+  if hi - lo < 12 then local c = (hi + lo) / 2; lo, hi = math.floor(c - 6), math.ceil(c + 6) end
+  return out, lo, hi
+end
+
 return C

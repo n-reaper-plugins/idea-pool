@@ -229,4 +229,82 @@ do
   T.eq(out[2], 2, "the first slot whose track exists is the anchor"); T.eq(out[1], 2, "a slot whose track is gone lands on the target")
 end
 
+-------------------------------------------------------------------- v0.2: view geometry
+do
+  local v = { x0 = 100, w = 400, t0 = 0, t1 = 4 }
+  T.eq(C.t2x(v, 2), 300, "time to x"); T.eq(C.x2t(v, 200), 1, "x to time")
+  local a, b = C.view_range(4, 1, 0)
+  T.eq(a, 0, "fit starts at 0"); T.ok(math.abs(b - 4.2) < 1e-9, "fit shows the idea plus 5%")
+  a, b = C.view_range(4, 2, 1)
+  T.ok(math.abs(b - 4.2) < 1e-9 and math.abs(b - a - 2.1) < 1e-9, "zoom 2, scrolled to the end")
+  T.eq(C.nice_step(100), 1, "100 px/s -> 1 s grid"); T.eq(C.nice_step(1000), 0.1, "1000 px/s -> 0.1 s grid")
+  T.eq(C.snap(1.12, 0.125), 1.125, "snap"); T.eq(C.snap(1.12, nil), 1.12, "snap off")
+
+  local box = { x0 = 100, x1 = 300, y0 = 10, y1 = 60, fin_px = 20, fout_px = 0 }
+  T.eq(C.hit_zone(box, 110, 12), "fin", "top-left = fade in")
+  T.eq(C.hit_zone(box, 295, 12), "fout", "top-right = fade out")
+  T.eq(C.hit_zone(box, 200, 12), "gain", "top middle = gain")
+  T.eq(C.hit_zone(box, 102, 40), "left", "left edge")
+  T.eq(C.hit_zone(box, 298, 40), "right", "right edge")
+  T.eq(C.hit_zone(box, 200, 40), "move", "body")
+  T.ok(C.hit_zone(box, 400, 40) == nil, "outside")
+end
+
+-------------------------------------------------------------------- v0.2: drags
+do
+  local m = { rel = 1, len = 2, soffs = 0.5, rate = 2, fin = 0.1, fout = 0.2, vol = 1 }
+  local f = C.drag(m, "move", 0.5)
+  T.eq(f.rel, 1.5, "move"); T.ok(f.len == nil, "move keeps length")
+  T.eq(C.drag(m, "move", -5).rel, 0, "not before the idea's start")
+  f = C.drag(m, "left", 0.5)
+  T.eq(f.rel, 1.5, "left trim start"); T.eq(f.len, 1.5, "left trim length"); T.eq(f.soffs, 1.5, "offset moves with rate 2")
+  f = C.drag(m, "left", -1)
+  T.eq(f.rel, 0.75, "left trim stops at the file start (offset 0.5 / rate 2)"); T.eq(f.soffs, 0, "offset 0")
+  f = C.drag(m, "left", 5)
+  T.ok(math.abs(f.len - C.MIN_LEN) < 1e-9, "left trim keeps a minimum length")
+  f = C.drag(m, "right", 1)
+  T.eq(f.len, 3, "right trim"); f = C.drag(m, "right", 10, 0, 4)
+  T.eq(f.len, 1.75, "right trim stops at the file end ((4 - 0.5) / 2)")
+  T.eq(C.drag({ rel = 1, len = 2, soffs = 0, midi = true }, "right", 10, 0, 4).len, 12, "MIDI: no file end")
+  T.ok(math.abs(C.drag(m, "fin", 0.3).fin - 0.4) < 1e-9, "fade in"); T.eq(C.drag(m, "fin", 5).fin, 1.8, "fade in stops at the fade out")
+  T.ok(math.abs(C.drag(m, "fout", -0.3).fout - 0.5) < 1e-9, "fade out (drag left = longer)")
+  T.ok(math.abs(C.lin_to_db(C.drag(m, "gain", 0, -24).vol) - 6) < 1e-9, "gain: 24 px up = +6 dB")
+  T.ok(math.abs(C.drag(m, "move", 0.49, 0, nil, 0.25).rel - 1.5) < 1e-9, "snap applies to moves")
+end
+
+-------------------------------------------------------------------- v0.2: peaks
+do
+  local ov = { rate = 10, mx = {}, mn = {} }
+  for i = 1, 100 do ov.mx[i] = i / 100; ov.mn[i] = -i / 100 end            -- 10 s ramp
+  local cols = C.peak_columns(ov, 2, 1, 1, 2)                              -- source 2..3 s in two columns
+  T.eq(#cols, 2, "two columns"); T.eq(cols[1][1], 0.25, "column max over its range"); T.eq(cols[2][2], -0.3, "column min")
+  cols = C.peak_columns(ov, 0, 1, 2, 1)                                     -- rate 2: 1 s of item = 2 s of source
+  T.eq(cols[1][1], 0.2, "playrate widens the source range")
+  cols = C.peak_columns(ov, 9.5, 2, 1, 2)
+  T.ok(cols[2] == false, "past the end of the file: no data")
+end
+
+-------------------------------------------------------------------- v0.2: MIDI
+do
+  local chunk = table.concat({
+    "<ITEM", "<SOURCE MIDI", "HASDATA 1 960 QN",
+    "E 0 90 3c 64", "E 480 80 3c 00",         -- C4 0..0.5 QN
+    "E 0 90 40 50", "X 240 ff 01 00",         -- E4 starts at 0.5, a meta event in between counts its delta
+    "E 240 90 40 00",                           -- E4 note-off as velocity 0 at 1.0
+    "e 960 91 43 7f", "E 960 81 43 00",        -- G4 channel 2, 2.0..3.0
+    "E 0 90 48 64",                             -- C5 never ends -> closed at the end (3.0)
+    ">", ">" }, "\n")
+  local p = C.midi_notes(chunk)
+  T.eq(#p.notes, 4, "four notes"); T.eq(p.tpq, 960, "ticks per QN")
+  T.eq(p.notes[1].pitch, 60, "C4"); T.eq(p.notes[1].e, 0.5, "C4 ends at 0.5 QN")
+  T.eq(p.notes[2].pitch, 64, "E4"); T.eq(p.notes[2].s, 0.5, "E4 start"); T.eq(p.notes[2].e, 1.0, "E4 ends (velocity 0 = off, X delta counted)")
+  T.eq(p.notes[3].s, 2, "G4 start"); T.eq(p.notes[3].vel, 127, "velocity")
+  T.eq(p.notes[4].e, 3, "hanging note closed at the end")
+  local notes, lo, hi = C.member_notes(p, { rel = 0, len = 1.2, soffs = 0.25 }, 120)   -- 0.5 s per QN
+  T.eq(#notes, 2, "only E4 and G4 are inside the member window (C4 lies before the 0.25 s offset)")
+  T.eq(notes[1].pitch, 64, "E4 first"); T.eq(notes[1].a, 0, "E4 at the member start"); T.eq(notes[1].b, 0.25, "E4 length 0.25 s")
+  T.ok(math.abs(notes[2].b - 1.2) < 1e-9, "G4 clipped at the member end"); T.ok(hi - lo >= 12, "pitch range at least an octave")
+  T.eq(#C.midi_notes("").notes, 0, "empty chunk")
+end
+
 T.done("test_core")

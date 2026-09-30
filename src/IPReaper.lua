@@ -279,6 +279,68 @@ function RA.measure(it)
   return { s0 = r.GetMediaItemTakeInfo_Value(tk, "D_STARTOFFS"), rate = r.GetMediaItemTakeInfo_Value(tk, "D_PLAYRATE"), fr = fr }
 end
 
+---------------------------------------------------------------------------------------------------------- peaks (v0.2)
+-- A waveform overview of a whole file: RATE peaks per second of source time, channels folded (max of maxima, min of
+-- minima). REAPER may have to build its .reapeaks first: begin, then step (a little per frame) until done, then read.
+RA.PEAK_RATE, RA.PEAK_MAX_LEN = 200, 900          -- peaks/s, seconds of file at most
+
+function RA.peaks_begin(file)
+  if not file or file == "" then return nil end
+  local src = r.PCM_Source_CreateFromFile(file)
+  if not src then return nil end
+  local need = r.PCM_Source_BuildPeaks(src, 0)
+  return { src = src, file = file, building = need ~= 0 }
+end
+
+-- true when the peaks are ready to read
+function RA.peaks_step(h)
+  if not h.building then return true end
+  if r.PCM_Source_BuildPeaks(h.src, 1) == 0 then r.PCM_Source_BuildPeaks(h.src, 2); h.building = false; return true end
+  return false
+end
+
+function RA.peaks_read(h)
+  local src = h.src
+  local flen = math.min(r.GetMediaSourceLength(src) or 0, RA.PEAK_MAX_LEN)
+  local nch = math.max(1, math.min(2, r.GetMediaSourceNumChannels(src) or 1))
+  local total = math.max(1, math.floor(flen * RA.PEAK_RATE))
+  local CH = 4096
+  local buf = r.new_array(CH * nch * 2)
+  local mx, mn = {}, {}
+  local done = 0
+  while done < total do
+    local n = math.min(CH, total - done)
+    buf.clear()
+    local ret = r.PCM_Source_GetPeaks(src, RA.PEAK_RATE, done / RA.PEAK_RATE, nch, n, 0, buf)
+    local got = math.min(n, (ret or 0) & 0xFFFFF)
+    local t = buf.table()
+    for i = 0, got - 1 do
+      local a, b = -1e9, 1e9
+      for c = 1, nch do
+        local x, y = t[i * nch + c] or 0, t[n * nch + i * nch + c] or 0
+        if x > a then a = x end
+        if y < b then b = y end
+      end
+      mx[done + i + 1], mn[done + i + 1] = a, b
+    end
+    if got < n then break end
+    done = done + n
+  end
+  r.PCM_Source_Destroy(src)
+  h.src = nil
+  return { rate = RA.PEAK_RATE, mx = mx, mn = mn, len = flen }
+end
+
+function RA.play_pos()
+  if (r.GetPlayState() & 1) == 1 then return r.GetPlayPosition2() end
+  return nil
+end
+
+function RA.tempo_at(pos)
+  if r.TimeMap2_GetDividedBpmAtTime then return r.TimeMap2_GetDividedBpmAtTime(0, pos) end
+  return r.Master_GetTempo()
+end
+
 ---------------------------------------------------------------------------------------------------------- misc
 function RA.cursor() return r.GetCursorPosition() end
 function RA.set_cursor(pos) r.SetEditCurPos(pos, true, false) end
