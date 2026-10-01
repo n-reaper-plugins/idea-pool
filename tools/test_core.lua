@@ -307,4 +307,27 @@ do
   T.eq(#C.midi_notes("").notes, 0, "empty chunk")
 end
 
+-------------------------------------------------------------------- v0.2.1
+do
+  local w = { pos = 10, len = 4, offs = 0 }
+  local mid = C.visible({ mid = 1, track = "T", rel = 1, len = 5, soffs = 0, rate = 1, vol = 1, fin = 0.3, fout = 0.4, midi = true }, w, 0.005)
+  T.eq(mid.fin, 0, "MIDI: no fade in even on a clipped edge"); T.eq(mid.fout, 0, "MIDI: no fade out")
+  local au = C.visible({ mid = 1, track = "T", rel = 1, len = 5, soffs = 0, rate = 1, vol = 1, fin = 0.3, fout = 0.4 }, w, 0.005)
+  T.eq(au.fin, 0.3, "audio keeps its fade in"); T.eq(au.fout, 0.005, "and the clip fade on a cut edge")
+  local box = { x0 = 100, x1 = 300, y0 = 10, y1 = 60, fin_px = 20, fout_px = 0, midi = true }
+  T.eq(C.hit_zone(box, 110, 12), "move", "MIDI top-left corner is not a fade handle")
+  T.eq(C.hit_zone(box, 200, 12), "move", "MIDI top edge is not a gain handle")
+  T.eq(C.hit_zone(box, 102, 40), "left", "MIDI still trims")
+  T.eq(C.card_take_name("R", "A", 1, "marker"), "> R · A [1]", "marker placement name")
+  T.eq(C.card_take_name("R", "A", 1, "audition"), "~ R · A [1]", "solo audition name")
+
+  local o, c = C.sublane_insert(0);  T.eq(o, 1, "plain track opens a folder"); T.eq(c, -1, "child closes it")
+  o, c = C.sublane_insert(-1);       T.eq(o, 1, "last child of a folder: opens its own"); T.eq(c, -2, "child closes both")
+  o, c = C.sublane_insert(-3);       T.eq(c, -4, "deep close is kept")
+  o, c = C.sublane_insert(1);        T.eq(o, 1, "folder track stays"); T.eq(c, 0, "lane = first child")
+  T.eq(C.depth_after_removal(1, -1), 0, "owner back to a plain track")
+  T.eq(C.depth_after_removal(1, -2), -1, "owner closes the outer folder again")
+  T.eq(C.depth_after_removal(1, 0), 1, "a lane in the middle changes nothing")
+end
+
 T.done("test_core")

@@ -79,6 +79,7 @@ function C.visible(m, w, clipfade)
   local cf = math.min(clipfade or 0, len / 2)
   local fin  = clipL and cf or math.min(m.fin or 0, len)
   local fout = clipR and cf or math.min(m.fout or 0, len)
+  if m.midi then fin, fout = 0, 0 end                 -- fades do not act on MIDI items
   return {
     track = m.track, pos = w.pos + (a - w.offs), len = len,
     soffs = (m.soffs or 0) + (a - m.rel) * (m.rate or 1),
@@ -437,7 +438,7 @@ end
 
 -- take name of a placement: "Riff · B [3]"  (the [3] is the card id: copies are recognised by it)
 function C.card_take_name(name, varname, cid, mode)
-  local pre = (mode == "frozen" and "* ") or (mode == "audition" and "> ") or ""
+  local pre = ({ frozen = "* ", marker = "> ", audition = "~ " })[mode] or ""
   return string.format("%s%s · %s [%s]", pre, name, varname or "?", tostring(cid))
 end
 
@@ -620,7 +621,7 @@ function C.snap(t, step) if not step or step <= 0 then return t end return math.
 C.EDGE_PX, C.HANDLE_PX = 5, 8
 function C.hit_zone(box, mx, my)
   if mx < box.x0 - 2 or mx > box.x1 + 2 or my < box.y0 - 2 or my > box.y1 + 2 then return nil end
-  local near_top = my <= box.y0 + C.HANDLE_PX
+  local near_top = (not box.midi) and my <= box.y0 + C.HANDLE_PX      -- no fade / gain handles on MIDI items
   if near_top and mx <= box.x0 + math.max(C.HANDLE_PX, box.fin_px or 0) + 2 and mx <= (box.x0 + box.x1) / 2 then return "fin" end
   if near_top and mx >= box.x1 - math.max(C.HANDLE_PX, box.fout_px or 0) - 2 and mx > (box.x0 + box.x1) / 2 then return "fout" end
   if mx <= box.x0 + C.EDGE_PX then return "left" end
@@ -745,6 +746,21 @@ function C.member_notes(parsed, m, bpm)
   if #out == 0 then lo, hi = 60, 72 end
   if hi - lo < 12 then local c = (hi + lo) / 2; lo, hi = math.floor(c - 6), math.ceil(c + 6) end
   return out, lo, hi
+end
+
+----------------------------------------------------------------------------- v0.2.1: sub-lanes
+-- A sub-lane is a child track directly under an original track (the "owner"). Folder depth is a delta per track:
+-- +1 opens a folder, -n closes n levels. Returns the new depth of the owner and the depth of the new first child.
+function C.sublane_insert(owner_depth)
+  if owner_depth > 0 then return owner_depth, 0 end           -- already a folder: the lane is its first child
+  return 1, owner_depth - 1                                    -- the owner opens a folder; the child closes it and whatever the owner closed
+end
+
+-- Removing a track that closes folders (negative depth): the track before it takes over the closing, so the total is kept.
+-- Returns the new depth of the previous track.
+function C.depth_after_removal(prev_depth, removed_depth)
+  if removed_depth < 0 then return prev_depth + removed_depth end
+  return prev_depth
 end
 
 return C

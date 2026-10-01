@@ -117,10 +117,20 @@ function UI.new(app)
     if btn(app.cfg.live and "Freeze all" or "Go live", "Stop following edits and markers everywhere (placements stay as they are).") then app:set("live", not app.cfg.live) end
     r.ImGui_SameLine(ctx)
     if btn("Sync now", nil, not app.cfg.live) then app:sync(); app.seen = -1 end
+    if app.aud then
+      r.ImGui_SameLine(ctx)
+      local c = app:card_view(app.aud.cid)
+      r.ImGui_TextColored(ctx, COL_OK, "PLAYING: " .. (c and c.name or "?") .. " (variant " .. ((function()
+        for _, v in ipairs(c and c.variants or {}) do if v.active then return v.name end end
+        return "?"
+      end)()) .. ")")
+      r.ImGui_SameLine(ctx)
+      if btn("Stop##aud_top", "Stop and remove the temporary tracks.") then app:stop_audition() end
+    end
     local ls = app.last_sync
     if ls and ls.stats then
       local parts = {}
-      for _, k in ipairs({ "created", "updated", "deleted", "adopted", "cuts", "copies", "auditions", "edits" }) do
+      for _, k in ipairs({ "created", "updated", "deleted", "adopted", "cuts", "copies", "markers", "edits" }) do
         if ls.stats[k] and ls.stats[k] > 0 then parts[#parts + 1] = ls.stats[k] .. " " .. k end
       end
       if #parts > 0 then r.ImGui_TextColored(ctx, COL_DIM, "Last sync: " .. table.concat(parts, ", ")) end
@@ -134,66 +144,72 @@ function UI.new(app)
     local cc = r.GetProjectStateChangeCount(0)
     if cc ~= state.sel_cc or not state.sel then state.sel_cc = cc; state.sel = app:selection() end
     local info = state.sel
-    r.ImGui_SetNextItemWidth(ctx, 200)
-    local ch, v = r.ImGui_InputText(ctx, "Name##stash_name", state.name)
+    r.ImGui_SetNextItemWidth(ctx, -1)
+    local ch, v = r.ImGui_InputText(ctx, "##stash_name", state.name)
     if ch then state.name = v end
-    r.ImGui_SameLine(ctx)
     if btn("Stash selected items", "Selected items (any tracks) become a new idea.", info.n == 0) then
       app:stash(state.name); state.name = ""; state.sel = nil
     end
     r.ImGui_Text(ctx, "Afterwards the items:")
     for _, o in ipairs({ { "keep", "stay (copy)" }, { "link", "become a placement" }, { "remove", "are removed" } }) do
-      r.ImGui_SameLine(ctx)
       if r.ImGui_RadioButton(ctx, o[2] .. "##stash_" .. o[1], app.cfg.stash_mode == o[1]) then app:set("stash_mode", o[1]) end
     end
-    if info.n == 0 then r.ImGui_TextColored(ctx, COL_DIM, "Select items on any tracks to stash them.")
+    if info.n == 0 then r.ImGui_TextColored(ctx, COL_DIM, "Select items on any tracks.")
     else r.ImGui_TextColored(ctx, COL_OK, string.format("%d item(s) on %d track(s) selected", info.n, info.tracks)) end
   end
 
+  -- the ideas list: click a name to open it; Play = audition on its own; Rename in place
   local function draw_cards()
     local cards = app.view.cards or {}
     heading(string.format("Ideas (%d)", #cards))
     if #cards == 0 then r.ImGui_TextColored(ctx, COL_DIM, "No ideas yet. Select items and press 'Stash selected items'."); return end
-    if not r.ImGui_BeginTable(ctx, "cards", 5, (r.ImGui_TableFlags_Borders and r.ImGui_TableFlags_Borders() or 0)) then return end
-    for _, h in ipairs({ "Idea", "Variants", "Tracks", "Placed", "" }) do r.ImGui_TableSetupColumn(ctx, h) end
-    r.ImGui_TableHeadersRow(ctx)
     for _, c in ipairs(cards) do
       r.ImGui_PushID(ctx, "card" .. c.cid)
-      r.ImGui_TableNextRow(ctx)
-      r.ImGui_TableSetColumnIndex(ctx, 0)
-      r.ImGui_TextColored(ctx, rgba(c.color), "■"); r.ImGui_SameLine(ctx)
-      r.ImGui_Text(ctx, (app.selected == c.cid and "> " or "") .. c.name)
-      r.ImGui_TableSetColumnIndex(ctx, 1)
-      local names = {}
-      for _, v in ipairs(c.variants) do names[#names + 1] = v.active and ("[" .. v.name .. "]") or v.name end
-      r.ImGui_Text(ctx, table.concat(names, " "))
-      r.ImGui_TableSetColumnIndex(ctx, 2); r.ImGui_Text(ctx, tostring(#c.slots))
-      r.ImGui_TableSetColumnIndex(ctx, 3)
-      r.ImGui_Text(ctx, string.format("%d", #c.places - c.auditions) .. (c.auditions > 0 and string.format(" + %d audition", c.auditions) or ""))
-      r.ImGui_TableSetColumnIndex(ctx, 4)
-      if small("Open", "Show this idea below.") then app.selected = c.cid end
+      r.ImGui_TextColored(ctx, rgba(c.color), "|")
+      r.ImGui_SameLine(ctx)
+      if state.rename == c.cid then
+        r.ImGui_SetNextItemWidth(ctx, 120)
+        local ch, v = r.ImGui_InputText(ctx, "##rename", state.rename_buf or c.name)
+        if ch then state.rename_buf = v end
+        r.ImGui_SameLine(ctx)
+        if small("OK##rn", "Markers named like the idea are renamed too.") then app:rename(c.cid, state.rename_buf or c.name); state.rename = nil end
+        r.ImGui_SameLine(ctx)
+        if small("Cancel##rn") then state.rename = nil end
+      else
+        if r.ImGui_Selectable(ctx, c.name .. "##sel", app.selected == c.cid) then app.selected = c.cid end
+        r.ImGui_Indent(ctx, 12)
+        if c.auditioning then
+          if small("Stop##aud", "Stop and remove the temporary tracks.") then app:stop_audition() end
+        else
+          if small("Play##aud", "Hear this idea on its own: temporary tracks with the original FX chains, looped, removed when you stop.") then app:audition(c.cid) end
+        end
+        r.ImGui_SameLine(ctx)
+        if small("Rename##rn", "Rename here; markers named like the idea follow.") then state.rename = c.cid; state.rename_buf = c.name end
+        r.ImGui_SameLine(ctx)
+        local names = {}
+        for _, v in ipairs(c.variants) do names[#names + 1] = v.active and ("[" .. v.name .. "]") or v.name end
+        r.ImGui_TextColored(ctx, COL_DIM, table.concat(names, " ") .. "  " .. (#c.places + (c.aud and 1 or 0)) .. " placed")
+        r.ImGui_Unindent(ctx, 12)
+      end
       r.ImGui_PopID(ctx)
     end
-    r.ImGui_EndTable(ctx)
   end
 
   local function draw_variants(c)
     r.ImGui_Text(ctx, "Variants:")
     for _, v in ipairs(c.variants) do
       r.ImGui_SameLine(ctx)
-      if btn((v.active and "[" .. v.name .. "]" or v.name) .. "##var" .. v.vid, "Show this variant in every linked placement (A/B).") then
+      if btn((v.active and "[" .. v.name .. "]" or v.name) .. "##var" .. v.vid, "Show this variant in every linked placement (A/B). While playing on its own, it switches live.") then
         app:set_active(c.cid, v.vid)
       end
     end
-    r.ImGui_SameLine(ctx)
     local act
     for _, v in ipairs(c.variants) do if v.active then act = v end end
-    if small("Duplicate", "New variant from the active one (then edit it in a placement).") and act then app:duplicate_variant(c.cid, act.vid) end
+    if small("Duplicate", "New variant from the active one (then edit it in the view).") and act then app:duplicate_variant(c.cid, act.vid) end
     r.ImGui_SameLine(ctx)
     if small("Delete variant", nil, #c.variants <= 1) and act then app:delete_variant(c.cid, act.vid) end
-    -- loudness
     local ch, on = r.ImGui_Checkbox(ctx, "Match loudness between variants##match", c.match)
-    tip("Every variant is played at the level of the reference variant (gated RMS, as in GainStageEQ),\nso switching A/B compares the sound, not the volume.")
+    tip("Every variant is played at the level of the reference variant (gated RMS, as in GainStageEQ),\nso switching A/B compares the sound, not the volume. MIDI items are not affected.")
     if ch then app:set_match(c.cid, on) end
     for _, v in ipairs(c.variants) do
       local lvl = v.level and string.format("%.1f dB", v.level) or "not measured"
@@ -210,7 +226,7 @@ function UI.new(app)
 
   local function draw_members(c, v)
     if not v then return end
-    r.ImGui_Text(ctx, string.format("Variant %s: %.3f s, %d item(s). Edits here apply to every linked placement.", v.name, v.len, #v.members))
+    r.ImGui_Text(ctx, string.format("Variant %s: %.3f s, %d item(s). Edits apply to every linked placement.", v.name, v.len, #v.members))
     if not r.ImGui_BeginTable(ctx, "members", 7, (r.ImGui_TableFlags_Borders and r.ImGui_TableFlags_Borders() or 0)) then return end
     for _, h in ipairs({ "Track", "Start (s)", "Length (s)", "Fade in", "Fade out", "Gain (dB)", "Mute" }) do r.ImGui_TableSetupColumn(ctx, h) end
     r.ImGui_TableHeadersRow(ctx)
@@ -223,9 +239,13 @@ function UI.new(app)
       if not m.measured and not m.midi then tip("Not measured: press Measure on a placement.") end
       r.ImGui_TableSetColumnIndex(ctx, 1); num_field(k .. "rel", "##rel", m.rel, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "rel", x) end)
       r.ImGui_TableSetColumnIndex(ctx, 2); num_field(k .. "len", "##len", m.len, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "len", x) end)
-      r.ImGui_TableSetColumnIndex(ctx, 3); num_field(k .. "fin", "##fin", m.fin, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "fin", x) end)
-      r.ImGui_TableSetColumnIndex(ctx, 4); num_field(k .. "fout", "##fout", m.fout, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "fout", x) end)
-      r.ImGui_TableSetColumnIndex(ctx, 5); num_field(k .. "vol", "##vol", db(m.vol), "%.1f", function(x) app:set_member(c.cid, v.vid, m.mid, "vol", 10 ^ (x / 20)) end)
+      if m.midi then                                  -- fades and gain do not act on MIDI items
+        for col = 3, 5 do r.ImGui_TableSetColumnIndex(ctx, col); r.ImGui_TextColored(ctx, COL_DIM, "-") end
+      else
+        r.ImGui_TableSetColumnIndex(ctx, 3); num_field(k .. "fin", "##fin", m.fin, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "fin", x) end)
+        r.ImGui_TableSetColumnIndex(ctx, 4); num_field(k .. "fout", "##fout", m.fout, "%.3f", function(x) app:set_member(c.cid, v.vid, m.mid, "fout", x) end)
+        r.ImGui_TableSetColumnIndex(ctx, 5); num_field(k .. "vol", "##vol", db(m.vol), "%.1f", function(x) app:set_member(c.cid, v.vid, m.mid, "vol", 10 ^ (x / 20)) end)
+      end
       r.ImGui_TableSetColumnIndex(ctx, 6)
       local ch, mu = r.ImGui_Checkbox(ctx, "##mute", m.mute ~= 0)
       if ch then app:set_member(c.cid, v.vid, m.mid, "mute", mu) end
@@ -234,17 +254,13 @@ function UI.new(app)
     r.ImGui_EndTable(ctx)
   end
 
+  -- placements as short blocks (the pane is narrow): where / what / status, then its buttons
   local function draw_places(c)
     if #c.places == 0 then r.ImGui_TextColored(ctx, COL_DIM, "Not placed yet."); return end
-    if not r.ImGui_BeginTable(ctx, "places", 4, (r.ImGui_TableFlags_Borders and r.ImGui_TableFlags_Borders() or 0)) then return end
-    for _, h in ipairs({ "Position", "Kind", "Status", "" }) do r.ImGui_TableSetupColumn(ctx, h) end
-    r.ImGui_TableHeadersRow(ctx)
     for _, p in ipairs(c.places) do
       r.ImGui_PushID(ctx, "p" .. c.cid .. "_" .. p.pid)
-      r.ImGui_TableNextRow(ctx)
-      r.ImGui_TableSetColumnIndex(ctx, 0); r.ImGui_Text(ctx, fmt_time(p.pos))
-      r.ImGui_TableSetColumnIndex(ctx, 1); r.ImGui_Text(ctx, p.kind)
-      r.ImGui_TableSetColumnIndex(ctx, 2)
+      r.ImGui_Text(ctx, fmt_time(p.pos) .. "   " .. p.kind)
+      r.ImGui_SameLine(ctx)
       if p.mixed > 0 then
         local words = {}
         for _, why in ipairs(p.reasons) do words[#words + 1] = REASON[why] or why end
@@ -253,15 +269,14 @@ function UI.new(app)
       else
         r.ImGui_TextColored(ctx, p.kind == "frozen" and COL_DIM or COL_OK, p.members .. " item(s)")
       end
-      r.ImGui_TableSetColumnIndex(ctx, 3)
       if small("Select", "Select the placement and its items, move the edit cursor there.") then app:select_placement(c.cid, p.pid) end
-      if p.kind == "audition" then
+      if p.kind == "marker" then
         r.ImGui_SameLine(ctx)
-        if small("Commit", "Keep it: becomes an ordinary placement, its marker is renamed '(placed) ...'.") then app:commit(c.cid, p.pid) end
+        if small("Keep", "Stop following the marker: the placement stays, the marker is removed.") then app:keep(c.cid, p.pid) end
       elseif p.kind == "linked" then
         r.ImGui_SameLine(ctx)
-        if small("Freeze", "Stop following the idea: this placement keeps its items as they are.") then app:freeze(c.cid, p.pid, true) end
-      else
+        if small("Freeze", "Stop following the idea: this placement keeps its items as they are (shown grey).") then app:freeze(c.cid, p.pid, true) end
+      elseif p.kind == "frozen" then
         r.ImGui_SameLine(ctx)
         if small("Unfreeze", "Follow the idea again (the frozen state is replaced).") then app:freeze(c.cid, p.pid, false) end
       end
@@ -276,12 +291,11 @@ function UI.new(app)
         if small("Revert") then app:request(c.cid, p.pid, "revert") end
       end
       r.ImGui_SameLine(ctx)
-      if small("Detach", "Its items become plain items, the placement is removed.") then app:detach(c.cid, p.pid) end
+      if small("Detach", "Its items become plain items, the placement is removed (a marker placement: its marker too).") then app:detach(c.cid, p.pid) end
+      r.ImGui_Separator(ctx)
       r.ImGui_PopID(ctx)
     end
-    r.ImGui_EndTable(ctx)
   end
-
 
   ------------------------------------------------------------------------------------------------ v0.2: idea view
   -- the active variant drawn like a tiny arrange view: one row per track, a waveform or notes per item.
@@ -343,7 +357,7 @@ function UI.new(app)
       local row = math.max(1, math.min(nrows, m.slot or 1))
       local by0 = y0 + RULER_H + (row - 1) * ROW_H + 3
       local b = { m = m, m0 = m0, x0 = C.t2x(vw, m.rel), x1 = C.t2x(vw, m.rel + m.len), y0 = by0, y1 = by0 + ROW_H - 6,
-                  fin_px = (m.fin or 0) * pps, fout_px = (m.fout or 0) * pps }
+                  fin_px = (m.fin or 0) * pps, fout_px = (m.fout or 0) * pps, midi = m0.midi or false }
       boxes[#boxes + 1] = b
     end
 
@@ -446,14 +460,17 @@ function UI.new(app)
           end
         end
         -- fades and handles
-        if (m.fin or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x0, b.y1, b.x0 + b.fin_px, b.y0, COL_FADE, 1.5) end
-        if (m.fout or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x1 - b.fout_px, b.y0, b.x1, b.y1, COL_FADE, 1.5) end
-        r.ImGui_DrawList_AddRectFilled(dl, b.x0 + b.fin_px - 3, b.y0, b.x0 + b.fin_px + 3, b.y0 + 6, COL_FADE)
-        r.ImGui_DrawList_AddRectFilled(dl, b.x1 - b.fout_px - 3, b.y0, b.x1 - b.fout_px + 3, b.y0 + 6, COL_FADE)
+        if not m.midi then                                    -- fades and gain do not act on MIDI items
+          if (m.fin or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x0, b.y1, b.x0 + b.fin_px, b.y0, COL_FADE, 1.5) end
+          if (m.fout or 0) > 0 then r.ImGui_DrawList_AddLine(dl, b.x1 - b.fout_px, b.y0, b.x1, b.y1, COL_FADE, 1.5) end
+          r.ImGui_DrawList_AddRectFilled(dl, b.x0 + b.fin_px - 3, b.y0, b.x0 + b.fin_px + 3, b.y0 + 6, COL_FADE)
+          r.ImGui_DrawList_AddRectFilled(dl, b.x1 - b.fout_px - 3, b.y0, b.x1 - b.fout_px + 3, b.y0 + 6, COL_FADE)
+        end
         local sel = state.sel_mid == b.m0.mid
         r.ImGui_DrawList_AddRect(dl, cx0, b.y0, cx1, b.y1, sel and COL_SEL or with_alpha(base, 0xFF), 0, 0, sel and 2 or 1)
-        local label = string.format("%+.1f dB", db(m.vol or 1))
-        r.ImGui_DrawList_AddText(dl, cx0 + 3, b.y1 - 14, COL_TEXT, label)
+        if not m.midi then
+          r.ImGui_DrawList_AddText(dl, cx0 + 3, b.y1 - 14, COL_TEXT, string.format("%+.1f dB", db(m.vol or 1)))
+        end
       end
     end
 
@@ -471,8 +488,12 @@ function UI.new(app)
       else b = hit() end
       if b and r.ImGui_SetTooltip then
         local m = b.m
-        r.ImGui_SetTooltip(ctx, string.format("%s\nstart %.3f s   length %.3f s\nfade in %.3f   fade out %.3f   gain %+.1f dB",
-          b.m0.track, m.rel, m.len, m.fin or 0, m.fout or 0, db(m.vol or 1)))
+        if m.midi then
+          r.ImGui_SetTooltip(ctx, string.format("%s (MIDI)\nstart %.3f s   length %.3f s", b.m0.track, m.rel, m.len))
+        else
+          r.ImGui_SetTooltip(ctx, string.format("%s\nstart %.3f s   length %.3f s\nfade in %.3f   fade out %.3f   gain %+.1f dB",
+            b.m0.track, m.rel, m.len, m.fin or 0, m.fout or 0, db(m.vol or 1)))
+        end
       end
     end
     ui.last_boxes, ui.last_view = boxes, vw           -- for the tests
@@ -512,98 +533,132 @@ function UI.new(app)
     ui.last_roll = notes
   end
 
-  local function draw_detail()
-    local c = app.selected and app:card_view(app.selected)
-    if not c then return end
-    heading("Idea: " .. c.name)
-    if state.rename == c.cid then
-      r.ImGui_SetNextItemWidth(ctx, 200)
-      local ch, v = r.ImGui_InputText(ctx, "##rename", state.rename_buf or c.name)
-      if ch then state.rename_buf = v end
-      r.ImGui_SameLine(ctx)
-      if small("OK") then app:rename(c.cid, state.rename_buf or c.name); state.rename = nil end
-      r.ImGui_SameLine(ctx)
-      if small("Cancel") then state.rename = nil end
-    else
-      if small("Rename", "Markers auditioning it must use the new name.") then state.rename = c.cid; state.rename_buf = c.name end
-      r.ImGui_SameLine(ctx)
-      if state.confirm == c.cid then
-        r.ImGui_TextColored(ctx, COL_WARN, "Delete this idea? Its placements become plain items.")
-        r.ImGui_SameLine(ctx)
-        if small("Yes, delete") then app:delete_card(c.cid); state.confirm = nil end
-        r.ImGui_SameLine(ctx)
-        if small("Cancel##del") then state.confirm = nil end
-      elseif small("Delete idea...") then state.confirm = c.cid end
-    end
-    local tracks = {}
-    for _, s in ipairs(c.slots) do tracks[#tracks + 1] = s.name .. (s.gone and " (deleted)" or "") end
-    r.ImGui_TextColored(ctx, COL_DIM, "Tracks: " .. table.concat(tracks, ", "))
-    if btn("Place at cursor", "A linked placement at the edit cursor, on the tracks it came from.") then app:place(c.cid, "cursor") end
-    r.ImGui_SameLine(ctx)
-    if btn("Place on selected track", "At the edit cursor; its first track goes to the selected track, the others follow in order.") then app:place(c.cid, "selected") end
-    r.ImGui_SameLine(ctx)
-    if btn("Place where it came from") then app:place(c.cid, "origin") end
-    if btn("Audition at cursor", "Adds a marker named '" .. c.name .. "' at the edit cursor: the idea plays there until you move or delete the marker, or Commit it.") then
-      app:audition(c.cid, state.play)
-    end
-    r.ImGui_SameLine(ctx)
-    local ch, pl = r.ImGui_Checkbox(ctx, "and play##play", state.play)
-    if ch then state.play = pl end
-    r.ImGui_Spacing(ctx)
-    local act = draw_variants(c)
-    r.ImGui_Spacing(ctx)
-    if act then draw_view(c, act); draw_roll(c, act) end
-    r.ImGui_Spacing(ctx)
-    draw_members(c, act)
-    r.ImGui_Spacing(ctx)
-    draw_places(c)
-  end
-
   local function draw_settings()
-    heading("Settings")
     r.ImGui_Text(ctx, "Undo:")
     r.ImGui_SameLine(ctx)
     if r.ImGui_RadioButton(ctx, "One step per edit##undo_silent", app.cfg.undo_mode == "silent") then app:set("undo_mode", "silent") end
     tip("Syncs add no undo points: Ctrl+Z undoes your own edit and the placements are derived again.")
-    r.ImGui_SameLine(ctx)
     if r.ImGui_RadioButton(ctx, "Separate sync steps##undo_steps", app.cfg.undo_mode == "steps") then app:set("undo_mode", "steps") end
     checkbox("Edits of placed items change the idea", "propagate", "Off: the placement shows MIXED until you Apply or Revert.")
     checkbox("Deleting a placement deletes its items", "delete_with_alias")
     checkbox("Keep MIDI pooled between placements", "keep_pool")
-    r.ImGui_SetNextItemWidth(ctx, 120)
-    local ch, v = r.ImGui_InputText(ctx, "Marker prefix for auditions##prefix", app.cfg.marker_prefix)
-    tip("Empty: a marker named exactly like an idea auditions it (as in PrototypeSequence).\nWith a prefix, e.g. 'idea:', only 'idea: Riff' does.")
-    if ch then app:set("marker_prefix", v) end
+    checkbox("Colour placed items like their idea", "color_items", "Frozen placements are always grey. Off: items keep the colour they had when stashed.")
+    checkbox("Sub-lane under each original track", "sub_lanes",
+      "New placements put their items on a child track under each original track, so they pass through that track's FX chain and\nvolume. Lanes appear when needed and disappear when empty. MIDI items stay on the original track.")
+    checkbox("Play on its own: copy the tracks' FX chains", "audition_fx", "So MIDI instruments and effects sound as on the original tracks.")
+    checkbox("Play on its own: loop", "audition_loop")
     r.ImGui_SetNextItemWidth(ctx, 90)
     local ch2, v2 = r.ImGui_InputInt(ctx, "ms fade on edges cut by a placement", app.cfg.clipfade_ms)
     if ch2 then app:set("clipfade_ms", math.max(0, math.min(1000, v2))) end
     if state.confirm ~= "detach" then
       if btn("Detach all...", "Remove every IdeaPool tag: tracks and items stay, the pool is forgotten.") then state.confirm = "detach" end
     else
-      r.ImGui_TextColored(ctx, COL_WARN, "Forget the pool and remove every IdeaPool tag from this project?")
-      r.ImGui_SameLine(ctx)
+      r.ImGui_TextColored(ctx, COL_WARN, "Forget the pool and remove every IdeaPool tag?")
       if btn("Yes, detach") then app:detach_all(); state.confirm = nil end
       r.ImGui_SameLine(ctx)
       if btn("Cancel##detach") then state.confirm = nil end
     end
   end
 
-  local function draw_ui()
-    draw_top()
+  -- LEFT: the preview of the selected idea
+  local function draw_preview()
+    local c = app.selected and app:card_view(app.selected)
+    if not c then
+      r.ImGui_TextColored(ctx, COL_DIM, "Open an idea from the list to see and edit it here.")
+      return
+    end
+    local act
+    for _, v in ipairs(c.variants) do if v.active then act = v end end
+    heading("Variant " .. (act and act.name or "?") .. " of " .. c.name)
+    if act then
+      draw_view(c, act)
+      draw_roll(c, act)
+      r.ImGui_Spacing(ctx)
+      if r.ImGui_CollapsingHeader(ctx, "Numbers##numbers", nil, r.ImGui_TreeNodeFlags_DefaultOpen and r.ImGui_TreeNodeFlags_DefaultOpen() or 0) then
+        draw_members(c, act)
+      end
+    end
+  end
+
+  -- MIDDLE: stash and the list of ideas
+  local function draw_ideas()
     draw_stash()
     draw_cards()
-    draw_detail()
-    draw_settings()
+  end
+
+  -- RIGHT: what you can do with the open idea, then settings
+  local function draw_idea()
+    local c = app.selected and app:card_view(app.selected)
+    if not c then
+      r.ImGui_TextColored(ctx, COL_DIM, "No idea open.")
+    else
+      heading("Idea: " .. c.name)
+      local tracks = {}
+      for _, s in ipairs(c.slots) do tracks[#tracks + 1] = s.name .. (s.gone and " (deleted)" or "") end
+      r.ImGui_TextColored(ctx, COL_DIM, "Tracks: " .. table.concat(tracks, ", "))
+      if c.auditioning then
+        if btn("Stop##aud_idea", "Stop and remove the temporary tracks.") then app:stop_audition() end
+      else
+        if btn("Play on its own##aud_idea", "Temporary tracks with the original FX chains, looped; removed when playback stops.\nSwitch A/B below while it plays.") then app:audition(c.cid) end
+      end
+      if btn("Place at cursor", "A linked placement at the edit cursor, on the tracks it came from.") then app:place(c.cid, "cursor") end
+      r.ImGui_SameLine(ctx)
+      if btn("Place on selected track", "At the edit cursor; its first track goes to the selected track, the others keep their distance.") then app:place(c.cid, "selected") end
+      r.ImGui_SameLine(ctx)
+      if btn("Where it came from") then app:place(c.cid, "origin") end
+      r.ImGui_TextColored(ctx, COL_DIM, "A marker named \"" .. c.name .. "\" places it at the marker (a region trims it).")
+      r.ImGui_Spacing(ctx)
+      draw_variants(c)
+      heading("Placements")
+      draw_places(c)
+      r.ImGui_Spacing(ctx)
+      if state.confirm == c.cid then
+        r.ImGui_TextColored(ctx, COL_WARN, "Delete this idea? Its placements become plain items.")
+        if small("Yes, delete") then app:delete_card(c.cid); state.confirm = nil end
+        r.ImGui_SameLine(ctx)
+        if small("Cancel##del") then state.confirm = nil end
+      elseif small("Delete idea...") then state.confirm = c.cid end
+    end
+    r.ImGui_Spacing(ctx)
+    if r.ImGui_CollapsingHeader(ctx, "Settings##settings", nil, 0) then draw_settings() end
     if app.view.foreign and app.view.foreign > 0 then
       r.ImGui_TextColored(ctx, COL_WARN, app.view.foreign .. " item(s) on the IDEAS track are not placements - ignored.")
     end
     if app.msg then r.ImGui_Spacing(ctx); r.ImGui_TextColored(ctx, COL_DIM, app.msg) end
   end
+
+  local function pane(id, h, fn)
+    local visible = r.ImGui_BeginChild(ctx, id, 0, h)
+    if visible then
+      local ok, e = pcall(fn)
+      if not ok then state.err = tostring(e) end
+    end
+    r.ImGui_EndChild(ctx)
+  end
+
+  -- three panes in one resizable table (drag the borders): preview 50% | ideas 22% | idea 28%
+  local function draw_ui()
+    draw_top()
+    local _, ah = r.ImGui_GetContentRegionAvail(ctx)
+    local h = math.max(260, num(ah, 560) - 6)
+    local flags = (r.ImGui_TableFlags_Resizable and r.ImGui_TableFlags_Resizable() or 0)
+                | (r.ImGui_TableFlags_BordersInnerV and r.ImGui_TableFlags_BordersInnerV() or 0)
+    if not r.ImGui_BeginTable(ctx, "panes", 3, flags) then return end
+    local stretch = r.ImGui_TableColumnFlags_WidthStretch and r.ImGui_TableColumnFlags_WidthStretch() or 0
+    r.ImGui_TableSetupColumn(ctx, "Preview", stretch, 0.50)
+    r.ImGui_TableSetupColumn(ctx, "Ideas", stretch, 0.22)
+    r.ImGui_TableSetupColumn(ctx, "Idea", stretch, 0.28)
+    r.ImGui_TableNextRow(ctx)
+    r.ImGui_TableSetColumnIndex(ctx, 0); pane("##pane_preview", h, draw_preview)
+    r.ImGui_TableSetColumnIndex(ctx, 1); pane("##pane_ideas", h, draw_ideas)
+    r.ImGui_TableSetColumnIndex(ctx, 2); pane("##pane_idea", h, draw_idea)
+    r.ImGui_EndTable(ctx)
+  end
   ui.draw_ui = draw_ui
 
   function ui.frame()
     local pushed = push_theme(ctx)
-    r.ImGui_SetNextWindowSize(ctx, 1000, 820, r.ImGui_Cond_FirstUseEver())
+    r.ImGui_SetNextWindowSize(ctx, 1280, 780, r.ImGui_Cond_FirstUseEver())
     local visible, open = r.ImGui_Begin(ctx, title, true)
     if visible then
       local ok, e = pcall(draw_ui)

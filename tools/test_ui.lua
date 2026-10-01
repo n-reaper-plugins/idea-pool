@@ -36,7 +36,7 @@ st.input_text = "Hook"; frame()
 st.clicks["Stash selected items"] = true; frame()
 T.eq(#app.view.cards, 1, "button stashes"); T.eq(app.view.cards[1].name, "Hook", "named from the field")
 frame()
-T.ok(has_text("Idea: Hook"), "new idea opened"); T.ok(has("Button:Place at cursor"), "place buttons shown")
+T.ok(has_text("Idea: Hook"), "new idea opened"); T.ok(has("Selectable:Hook##sel"), "listed in the middle pane"); T.ok(has("Button:Place at cursor"), "place buttons shown")
 T.ok(has_text("A: -6.0 dB"), "variant level shown")
 
 -- place, then the placement row
@@ -70,11 +70,39 @@ local placed
 for _, it in ipairs(gtr.items) do if math.abs(it.p.D_POSITION - 30) < 1e-6 then placed = it end end
 T.ok(placed and math.abs(placed.p.D_FADEINLEN - 0.2) < 1e-6, "fade typed in the window reaches the placement")
 
--- audition button
+-- three panes: every BeginChild has its EndChild, also when a pane is clipped
+local begins, ends = 0, 0
+reaper.ImGui_BeginChild = function() begins = begins + 1; return true end
+reaper.ImGui_EndChild = function() ends = ends + 1 end
+frame(); T.eq(begins, 3, "three panes"); T.eq(ends, 3, "and every one is closed")
+begins, ends = 0, 0
+reaper.ImGui_BeginChild = function() begins = begins + 1; return false end
+frame(); T.eq(begins, ends, "balanced when the panes are clipped")
+reaper.ImGui_BeginChild, reaper.ImGui_EndChild = nil, nil
+
+-- Play on its own, from the list
 S.cursor = 50
-st.clicks["Audition at cursor"] = true; frame(); frame()
-T.eq(#S.markers, 1, "audition adds a marker"); T.eq(S.markers[1].name, "Hook", "named like the idea")
-T.ok(has("SmallButton:Commit"), "audition row offers Commit")
+st.clicks["Play"] = true; frame(); frame()
+T.ok(app.aud ~= nil, "Play in the list starts a solo audition")
+T.ok(S.playing, "and playback")
+frame()
+T.ok(has_text("PLAYING: Chords") or has_text("PLAYING: Hook"), "the status line says what is playing")
+T.ok(has("SmallButton:Stop##aud"), "the list row offers Stop")
+st.clicks["Stop"] = true; frame(); frame()
+T.ok(app.aud == nil, "Stop removes the audition")
+T.eq(#S.markers, 0, "no marker is involved")
+
+-- a marker placement, then Rename in the list renames the marker too
+local placed_before = #app.view.cards[1].places
+Mock.marker("Hook", 70); app:sync(); frame()
+T.eq(#app.view.cards[1].places, placed_before + 1, "the marker placed the idea")
+st.clicks["Rename"] = true; frame()
+T.eq(ui.state.rename, app.view.cards[1].cid, "Rename opens an input in the list")
+ui.state.rename_buf = "Hook v2"; frame()
+st.clicks["OK"] = true; frame(); frame()
+T.eq(app.view.cards[1].name, "Hook v2", "renamed in the list")
+T.eq(S.markers[1].name, "Hook v2", "the marker followed the new name")
+T.eq(#app.view.cards[1].places, placed_before + 1, "and still places the idea")
 
 -- v0.2: the idea view -------------------------------------------------------------------------------
 local draws = { line = 0, rect = 0, text = {} }

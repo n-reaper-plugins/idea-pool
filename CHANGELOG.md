@@ -1,5 +1,18 @@
 # Changelog
 
+## 0.2.1 – three panes, play on its own
+* **Layout**: three resizable panes – preview (50%), stash + ideas list, idea actions + settings (collapsible).
+* **Play on its own** replaces "Audition at cursor": temporary tracks (one per original track, FX chain copied), solo,
+  loop, A/B switching live, full cleanup on stop / close / leftovers after a crash or undo; no undo points.
+* **Frozen placements are grey** (items and placement item); items of placements are coloured like their idea (option);
+  originals restored when the option is switched off.
+* **Rename in the ideas list**; renaming an idea renames the markers that place it.
+* **Markers simplified**: marker name = idea name (no prefix); **Keep** replaces Commit and removes the marker; Detach removes it too.
+* **MIDI items**: no fade / gain handles, no fades written, excluded from loudness matching.
+* **Sub-lanes** (option): items on a child track under each original track (through its FX chain), created on demand,
+  removed when empty, folder depths restored; MIDI stays on the original track.
+* 498 offline checks (core 185, sync 239, UI 59, bundle 15).
+
 ## 0.2.0 – the idea view
 * Waveform view of the active variant in the window: one row per track, peaks read from REAPER's .reapeaks of the
   file (built in the background, a little per frame), fade shapes drawn on the waveform, gain label, playhead.

@@ -1,4 +1,4 @@
-# IdeaPool design (v0.2.0)
+# IdeaPool design (v0.2.1)
 
 ## Model
 | IdeaPool | AliasTrack equivalent | Notes |
@@ -78,12 +78,42 @@ n-reaper-plugins/nlib            (own repo, own tests, tagged v0.x)
 * A drag is previewed without writing anything; releasing it writes the def once (one undo step), and the sync
   updates every linked placement.
 
-## Limits in v0.2.0
+## v0.2.1
+**Panes.** left = see/edit (preview, piano roll, numbers), middle = choose (stash, list), right = act (place, variants,
+placements, settings). One resizable ImGui table, one child window per cell (own scrolling). Pane order follows the work flow.
+
+**Placement kinds.** `linked` (default) · `frozen` (no sync either way, grey) · `marker` (mode `m:<key>`: follows a marker and goes with it) ·
+`audition` (mode `t`: the temporary placement of a solo audition; has no row, only a playhead range).
+
+**Solo audition.** `audition(cid)` inserts one track per slot at the end of the project (tag `IP_lane = audition`), copies the
+original track's `<FXCHAIN>` block into it (fresh FX GUIDs), saves and clears every track's solo, solos the temporary tracks,
+saves the loop points and repeat state and sets the loop to the idea, places the idea as a placement with mode `t` (so A/B,
+loudness matching and edits are just the normal engine), and plays. `tick` ends it when the transport has stopped; `shutdown` ends it
+when the script closes. Cleanup deletes the items first and the tracks last. A temporary placement or track that no running audition
+owns (undo, crash) is removed by the next sync. All of it runs with write mode `none`: no undo points.
+
+**Colours.** A placement remembers how its items are coloured (`IP_col`: `g` frozen, `i` idea, `o` original); items are recoloured only when
+that changes (frozen toggled, option toggled), so a hand-picked colour survives while the option is off. The stashed colour is kept per item.
+
+**Markers.** Marker name = idea name (case and spaces ignored); regions trim. Renaming an idea renames the markers that placed it.
+`Keep` = ordinary placement + marker removed (otherwise the marker would place it again). v0.2.0 `a:` tags are read as markers.
+
+**MIDI.** `visible()` gives MIDI pieces no fades; the view shows no fade/gain handles; the member table shows `-`; loudness factors skip MIDI.
+(Assumption: item fades and item volume do not act on MIDI events. To confirm: spike A5.)
+
+**Sub-lanes.** A lane is a child track of the owner (tag `IP_lane = sub:<owner guid>`). Folder depth is a delta per track, so:
+plain owner (0) -> owner 1, lane -1; owner that closes folders (-n) -> owner 1, lane -n-1; owner that already is a folder (1) -> lane 0, first child.
+Removing a lane that closes folders hands its negative depth to the track before it, *before* deleting (so it works whether or not REAPER fixes depths itself).
+A lane is deleted when it is empty and no placement's track map mentions it. MIDI slots (`slot.midi`) stay on the original track.
+Each placement keeps its own explicit slot->track map, so switching the option never moves existing placements.
+
+## Limits in v0.2.1
 * One active variant per idea for all linked placements (no per-placement variant pin yet).
 * Level ignores fades and take FX; MIDI items are not measured.
 * Frozen mode (freeze all) shows the pool but not MIXED states.
 
 ## Open questions
+0. **Frozen = grey** is per item (a track colour cannot differ per placement). Right reading of "display frozen by track colour"?
 1. **Per-placement variant pin**: should a placement be able to stay on B while others switch to A?
 2. **Solo audition** (hear an idea on its own, not in context): worth a hidden audition track, or is the marker enough?
 3. **Commit**: rename the marker to "(placed) …" (now), delete it, or leave it and just stop matching?

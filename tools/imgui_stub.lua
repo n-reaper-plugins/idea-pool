@@ -26,6 +26,15 @@ function M.install(R)
       if st.clicks[label] then st.clicks[label] = nil; return true, not v end
       return false, v
     end,
+    ImGui_BeginChild = function() return true end,
+    ImGui_CollapsingHeader = function() return true end,
+    ImGui_Selectable = function(_, label)
+      st.calls[#st.calls + 1] = "Selectable:" .. label
+      local base = label:gsub("##.*$", "")
+      st.texts[#st.texts + 1] = base
+      if st.clicks[base] then st.clicks[base] = nil; return true end
+      return false
+    end,
     ImGui_Text = function(_, t) st.texts[#st.texts + 1] = t end,
     ImGui_TextColored = function(_, c, t) st.texts[#st.texts + 1] = t; st.last_color = st.last_color or {}; st.last_color[t] = c end,
     ImGui_BeginDragDropTarget = function() return st.drop ~= nil end,

@@ -24,7 +24,10 @@ App.DEFAULTS = {
   clipfade_ms = 5,
   keep_pool = true,          -- MIDI stays pooled between linked placements
   stash_mode = "keep",       -- after Stash, the selected items: "keep" (copy) | "link" (become a placement) | "remove"
-  marker_prefix = "",        -- "" = a marker named exactly like a card auditions it (PrototypeSequence rule)
+  color_items = true,        -- items of placements get their idea's colour (frozen ones are always grey)
+  sub_lanes = false,         -- place the items on a sub-lane under each original track (inside its FX chain)
+  audition_fx = true,        -- a solo audition copies the original tracks' FX chains (instruments!)
+  audition_loop = true,      -- a solo audition loops over the idea
   match_max_db = 24,
 }
 
@@ -104,10 +107,12 @@ function App:notes(chunk)
   return c
 end
 
--- idea-local playhead of card view c: the first (non-frozen) placement under the play position
+-- idea-local playhead of card view c: the solo audition, else the first (non-frozen) placement under the play position
 function App:playhead(c)
   local p = RA.play_pos()
   if not p or not c then return nil end
+  local a = c.aud
+  if a and p >= a.pos and p < a.pos + a.len + 1e-6 then return p - a.pos + a.offs end
   for _, pl in ipairs(c.places) do
     if pl.kind ~= "frozen" and p >= pl.pos and p < pl.pos + pl.len then return p - pl.pos + (pl.offs or 0) end
   end
@@ -117,6 +122,7 @@ end
 ---------------------------------------------------------------------------------------------------------- tick
 function App:tick()
   self:work_peaks(0.01)
+  if self.aud and r.time_precise() - self.aud.t0 > 0.5 and not RA.is_playing() then self:stop_audition() end
   local cc = RA.change_count()
   local now = r.time_precise()
   if cc ~= self.seen then self.seen = cc; self.changed_at = now; self.pending = true end
@@ -150,10 +156,14 @@ end
 
 -- the lane, the pool and every card's placements and members, from one scan. No writes.
 function App:build(W)
-  local M = { W = W, cards = {}, order = {}, stray = {}, release_lanes = {}, free = {}, foreign = {} }
+  local M = { W = W, cards = {}, order = {}, stray = {}, release_lanes = {}, free = {}, foreign = {}, sub = {}, aud_tracks = {} }
   for _, T in ipairs(W.tracks) do
     if T.lane == "ideas" then
       if M.lane then M.release_lanes[#M.release_lanes + 1] = T else M.lane = T end
+    elseif T.lane == "audition" then M.aud_tracks[#M.aud_tracks + 1] = T
+    elseif T.lane:sub(1, 4) == "sub:" then
+      local owner = T.lane:sub(5)
+      if M.sub[owner] then M.release_lanes[#M.release_lanes + 1] = T else M.sub[owner] = T end
     elseif T.lane ~= "" then M.release_lanes[#M.release_lanes + 1] = T end
   end
   local pool = M.lane and C.json_decode(M.lane.pool or "")
@@ -183,7 +193,9 @@ function App:build(W)
             W = { pos = I.pos, len = I.len, offs = I.soffs },
             W0 = (#w0 >= 3) and { pos = tonumber(w0[1]), len = tonumber(w0[2]), offs = tonumber(w0[3]) } or nil,
             has = C.list_decode(I.tag_h), map = split_list(I.tag_map), mode = I.tag_mode or "", var_last = I.tag_v,
+            col = I.tag_col or "",
           }
+          if G.inst[pid].mode:sub(1, 2) == "a:" then G.inst[pid].mode = "m:" .. G.inst[pid].mode:sub(3) end   -- v0.2.0 tag
           G.order[#G.order + 1] = pid
         else
           G = M.cards[C.card_code(I.tname) or ""]
@@ -196,7 +208,7 @@ function App:build(W)
   end
 
   for _, I in ipairs(W.items) do
-    if I.T.lane == "" then
+    if I.T.lane == "" or I.T.lane == "audition" or I.T.lane:sub(1, 4) == "sub:" then
       if I.tag_m ~= "" then
         local cid, pid, mid = parse_bar(I.tag_m)
         mid = tonumber(mid)
@@ -276,12 +288,27 @@ end
 function App:piece(G, P, m)
   local mm = setmetatable({ track = slot_guid(G, P, m.slot) }, { __index = m })
   local N = C.visible(mm, P.W, (self.cfg.clipfade_ms or 0) / 1000)
-  if N then N.vol = N.vol * (G.factor[P.def] or 1) end
+  if N and not m.midi then N.vol = N.vol * (G.factor[P.def] or 1) end
   return N
 end
 
 local function syncs(P) return P.mode ~= "frozen" end
-local function is_audition(P) return P.mode:sub(1, 2) == "a:" end
+local function is_marker(P) return P.mode:sub(1, 2) == "m:" end       -- follows a marker (and goes with it)
+local function is_temp(P) return P.mode == "t" end                     -- a solo audition (temporary tracks)
+local function driven(P) return is_marker(P) or is_temp(P) end         -- no cut detection, no split children
+local function kind_of(P) return (P.mode == "frozen" and "frozen") or (is_marker(P) and "marker") or (is_temp(P) and "audition") or "linked" end
+
+local FROZEN_RGB = { 110, 110, 125 }
+local function grey() return r.ColorToNative(FROZEN_RGB[1], FROZEN_RGB[2], FROZEN_RGB[3]) end
+
+-- item colour of a placement's items: frozen = grey, else the idea's colour (option), else what the item had when stashed
+function App:paint(ptr, G, kind, m)
+  local col
+  if kind == "g" then col = grey()
+  elseif kind == "i" then col = G.card.color
+  else col = m and m.color or 0 end
+  RA.set_item_color(ptr, col)
+end
 
 ---------------------------------------------------------------------------------------------------------- cuts
 function App:do_cuts(M)
@@ -292,7 +319,7 @@ function App:do_cuts(M)
     for _, pid in ipairs(G.order) do
       local P = G.inst[pid]
       local times = {}
-      if def and syncs(P) and not is_audition(P) then
+      if def and syncs(P) and not driven(P) then
         for mid, mem in pairs(P.members) do
           local m = C.member_by_mid(def, mid)
           if m and mem.S then
@@ -331,21 +358,29 @@ function App:new_alias(M, G, pos, len, mode, map)
   local card = G.card
   local def = card.variants[card.active]
   RA.touch()
-  local it = RA.create_alias(M.lane.ptr, pos, len, 0,
-    C.card_take_name(card.name, def and def.name, G.cid, is_audition({ mode = mode or "" }) and "audition" or ""), card.color)
+  mode = mode or ""
+  local style = (mode:sub(1, 2) == "m:" and "marker") or (mode == "t" and "audition") or ""
+  local it = RA.create_alias(M.lane.ptr, pos, len, 0, C.card_take_name(card.name, def and def.name, G.cid, style), card.color)
   local pid = new_pid(card)
+  local fm = full_map(card, map)
+  -- tags now: a placement is recognised by them, and a later sync must not take it for a copy
+  RA.set_item_tag(it, "inst", G.cid .. "|" .. pid)
+  RA.set_item_tag(it, "map", table.concat(fm, ","))
+  RA.set_item_tag(it, "mode", mode)
+  RA.set_item_tag(it, "var", card.active)
   local I = RA.read_item(it, M.lane)
   G.inst[pid] = { pid = pid, item = I, members = {}, mixed = {}, W = { pos = pos, len = len, offs = 0 }, has = {},
-                  map = full_map(card, map), mode = mode or "", copy = true }
+                  map = fm, mode = mode, copy = true, col = "" }
   G.order[#G.order + 1] = pid
   return G.inst[pid]
 end
 
--- markers named like a card -> audition placements that follow them
-function App:auditions(M)
+-- a marker named like an idea puts the idea there (a region trims it); the placement goes with the marker.
+-- Also: leftovers of a solo audition (after an undo, a crash) are marked dead.
+function App:markers(M)
   local want = {}                                   -- [marker key] = { cid, mk }
   for _, mk in ipairs(M.W.markers) do
-    local cid = C.marker_card(mk.name, self.cfg.marker_prefix, M.by_name)
+    local cid = C.marker_card(mk.name, "", M.by_name)
     if cid then want[mk.key] = { cid = cid, mk = mk } end
   end
   local have = {}
@@ -353,7 +388,8 @@ function App:auditions(M)
     local G = M.cards[cid]
     for _, pid in ipairs(G.order) do
       local P = G.inst[pid]
-      if is_audition(P) then
+      if is_temp(P) and not (self.aud and self.aud.cid == cid and self.aud.pid == pid) then P.dead = true end
+      if is_marker(P) then
         local key = P.mode:sub(3)
         local w = want[key]
         if w and w.cid == cid and not have[key] then
@@ -376,8 +412,8 @@ function App:auditions(M)
       local G = M.cards[w.cid]
       local def = G.card.variants[G.card.active]
       local len = w.mk.isrgn and (w.mk.rgnend - w.mk.pos) or (def and C.def_extent(def) or 1)
-      self:new_alias(M, G, w.mk.pos, math.max(len, 0.01), "a:" .. key)
-      self.stats.auditions = (self.stats.auditions or 0) + 1
+      self:new_alias(M, G, w.mk.pos, math.max(len, 0.01), "m:" .. key)
+      self.stats.markers = (self.stats.markers or 0) + 1
     end
   end
 end
@@ -387,7 +423,7 @@ function App:resolve_instances(G, M)
   -- 1. split pieces of known placements (same card, same anchor, inside the old extent)
   for _, pid in ipairs({ table.unpack(G.order) }) do
     local K = G.inst[pid]
-    if K.known and syncs(K) and not is_audition(K) and not K.dead then
+    if K.known and syncs(K) and not driven(K) and not K.dead then
       local cands = {}
       for _, I in ipairs(G.untagged) do cands[#cands + 1] = { pos = I.pos, len = I.len, offs = I.soffs, I = I } end
       for _, c in ipairs(C.split_children(K.W0, K.W, cands)) do
@@ -475,7 +511,7 @@ function App:classify_edits(G, M)
               edited[mid] = true
               local e = res.edit
               e.track = nil
-              if e.props.vol then e.props.vol = e.props.vol / (G.factor[P.def] or 1) end
+              if e.props.vol and not m.midi then e.props.vol = e.props.vol / (G.factor[P.def] or 1) end
               C.apply_edit(m, e)
               self.stats.edits = (self.stats.edits or 0) + 1
             end
@@ -532,7 +568,7 @@ function App:handle_requests(G, M)
             end
             m.rel, m.len, m.soffs = A.pos - P.W.pos + P.W.offs, A.len, A.soffs
             for _, k in ipairs(C.PROPS) do m[k] = A[k] end
-            m.vol = A.vol / (G.factor[P.def] or 1)
+            m.vol = m.midi and A.vol or A.vol / (G.factor[P.def] or 1)
             m.fin, m.fout = A.fin, A.fout
           end
           P.mixed[mid] = nil
@@ -568,6 +604,7 @@ function App:materialize(G, M)
     local P = G.inst[pid]
     local def = card.variants[P.def]
     local has_new, wanted, present, missing = {}, 0, 0, 0
+    local ckind = (P.mode == "frozen" and "g") or (self.cfg.color_items and "i") or "o"
     if P.dead then
       RA.touch(); RA.delete_item(P.item.ptr); P.removed = true
     elseif not syncs(P) then
@@ -610,6 +647,7 @@ function App:materialize(G, M)
               RA.set_item_tag(adopted.ptr, "mem", G.cid .. "|" .. pid .. "|" .. m.mid)
               local S = RA.write_member(adopted.ptr, N, T.ptr)
               RA.set_item_tag(adopted.ptr, "app", C.snap_encode(S))
+              self:paint(adopted.ptr, G, ckind, m)
               present = present + 1
               has_new[m.mid] = true
               self.stats.adopted = (self.stats.adopted or 0) + 1
@@ -620,12 +658,18 @@ function App:materialize(G, M)
               local it, S = RA.create_member(T.ptr, m.chunk, N, self.cfg.keep_pool)
               RA.set_item_tag(it, "mem", G.cid .. "|" .. pid .. "|" .. m.mid)
               RA.set_item_tag(it, "app", C.snap_encode(S))
+              self:paint(it, G, ckind, m)
               present = present + 1
               has_new[m.mid] = true
               self.stats.created = (self.stats.created or 0) + 1
             end
           end
         end
+      end
+    end
+    if not P.dead and (P.col or "") ~= ckind then                       -- frozen / colour option changed: recolour its items
+      for mid, mem in pairs(P.members) do
+        RA.touch(); self:paint(mem.I.ptr, G, ckind, def and C.member_by_mid(def, mid))
       end
     end
     local others = 0
@@ -643,14 +687,18 @@ function App:materialize(G, M)
           map = table.concat(P.map, ","),
           mode = P.mode,
           var = syncs(P) and P.def or (P.var_last or ""),
+          col = ckind,
         }
-        local cur = { inst = I.tag_i, win = I.tag_w, has = I.tag_h or "", map = I.tag_map or "", mode = I.tag_mode or "", var = I.tag_v or "" }
+        local cur = { inst = I.tag_i, win = I.tag_w, has = I.tag_h or "", map = I.tag_map or "", mode = I.tag_mode or "",
+                      var = I.tag_v or "", col = I.tag_col or "" }
         for k, v in pairs(want) do if cur[k] ~= v then RA.touch(); RA.set_item_tag(I.ptr, k, v) end end
         local shown = syncs(P) and def or card.variants[P.var_last or ""] or def
         local def_name = shown and shown.name or "?"
-        local style = (P.mode == "frozen" and "frozen") or (is_audition(P) and "audition") or ""
+        local style = (P.mode == "frozen" and "frozen") or (is_marker(P) and "marker") or (is_temp(P) and "audition") or ""
         local want_name = C.card_take_name(card.name, def_name, G.cid, style)
-        if I.tname ~= want_name or not P.known then RA.touch(); RA.style_alias(I.ptr, want_name, card.color) end
+        if I.tname ~= want_name or not P.known then
+          RA.touch(); RA.style_alias(I.ptr, want_name, P.mode == "frozen" and grey() or card.color)
+        end
       end
     end
   end
@@ -673,7 +721,7 @@ function App:finish_card(G, M)
 end
 
 function App:reconcile(M)
-  if M.lane then self:auditions(M) end
+  if M.lane then self:markers(M) end
   for _, cid in ipairs(M.order) do
     local G = M.cards[cid]
     self:resolve_instances(G, M)
@@ -692,6 +740,11 @@ function App:reconcile(M)
     local enc = C.json_encode(M.pool)
     if enc ~= M.raw then RA.touch(); RA.set_track_tag(M.lane.ptr, "pool", enc) end
   end
+  -- temporary audition tracks that nobody is playing (after an undo or a crash): their items went with the dead
+  -- placements above; the tracks go last, so no item pointer is used after its track is deleted
+  if not self.aud then
+    for _, T in ipairs(M.aud_tracks) do RA.touch(); RA.delete_track(T.ptr) end
+  end
 end
 
 ---------------------------------------------------------------------------------------------------------- view
@@ -702,7 +755,8 @@ function App:make_view(M)
     local card = G.card
     local c = { cid = cid, name = card.name, color = card.color, active = card.active, match = card.match or false,
                 bpm = card.bpm or 120,
-                variants = {}, slots = {}, places = {}, auditions = 0, frozen = 0 }
+                variants = {}, slots = {}, places = {}, markers = 0, frozen = 0,
+                auditioning = (self.aud and self.aud.cid == cid) or false }
     for _, vid in ipairs(self:variant_ids(card)) do
       local def = card.variants[vid]
       local members = {}
@@ -719,7 +773,7 @@ function App:make_view(M)
     end
     for k, s in ipairs(card.slots) do
       local T = track_of(M.W, s.guid)
-      c.slots[k] = { name = T and T.name or s.name, gone = T == nil }
+      c.slots[k] = { name = T and T.name or s.name, gone = T == nil, midi = s.midi or false }
     end
     for _, pid in ipairs(G.order) do
       local P = G.inst[pid]
@@ -727,12 +781,16 @@ function App:make_view(M)
         local reasons = {}
         for _, why in pairs(P.mixed) do reasons[#reasons + 1] = why end
         table.sort(reasons)
-        local kind = (P.mode == "frozen" and "frozen") or (is_audition(P) and "audition") or "linked"
-        if kind == "audition" then c.auditions = c.auditions + 1 elseif kind == "frozen" then c.frozen = c.frozen + 1 end
-        local count = P.count
-        if not count then count = 0; for _ in pairs(P.members) do count = count + 1 end end
-        c.places[#c.places + 1] = { pid = pid, pos = P.W.pos, len = P.W.len, offs = P.W.offs, kind = kind, mixed = #reasons,
-                                    reasons = reasons, members = count }
+        local kind = kind_of(P)
+        if kind == "audition" then                                   -- a solo audition is not a placement: no row, but a playhead
+          c.aud = { pid = pid, pos = P.W.pos, len = P.W.len, offs = P.W.offs }
+        else
+          if kind == "marker" then c.markers = c.markers + 1 elseif kind == "frozen" then c.frozen = c.frozen + 1 end
+          local count = P.count
+          if not count then count = 0; for _ in pairs(P.members) do count = count + 1 end end
+          c.places[#c.places + 1] = { pid = pid, pos = P.W.pos, len = P.W.len, offs = P.W.offs, kind = kind, mixed = #reasons,
+                                      reasons = reasons, members = count }
+        end
       end
     end
     table.sort(c.places, function(a, b) return a.pos < b.pos end)
@@ -754,7 +812,11 @@ function App:sync(view_only, mode_override)
   local ok, err = pcall(function()
     for _ = 1, 4 do
       local M = self:build(RA.scan())
-      if not self:do_cuts(M) then self:reconcile(M); done = M; break end
+      if not self:do_cuts(M) then
+        self:reconcile(M); done = M
+        if next(M.sub) or self.cfg.sub_lanes then self:cleanup_sublanes() end
+        break
+      end
     end
   end)
   local changed = RA.end_writes()
@@ -786,11 +848,17 @@ function App:ensure_lane()
   return tr
 end
 
+-- the track an item "belongs to": its own, or the owner of the sub-lane it is on
+function App:home(W, T)
+  if T.lane:sub(1, 4) == "sub:" then return W.by_guid[T.lane:sub(5)] or T end
+  return T
+end
+
 function App:selection()
   local W = RA.scan()
   local sel, n_members = {}, 0
   for _, I in ipairs(W.items) do
-    if I.sel and I.T.lane == "" then
+    if I.sel and (I.T.lane == "" or I.T.lane:sub(1, 4) == "sub:") then
       sel[#sel + 1] = I
       if I.tag_m ~= "" then n_members = n_members + 1 end
     end
@@ -830,13 +898,15 @@ function App:stash(name, mode)
     pool.next_card = tonumber(cid) + 1
     local slots, slot_of = {}, {}
     for _, I in ipairs(sel) do
-      if not slot_of[I.T.guid] then slots[#slots + 1] = { guid = I.T.guid, name = I.T.name }; slot_of[I.T.guid] = #slots end
+      local H = self:home(info.W, I.T)                              -- an item on a sub-lane belongs to its owner track
+      if not slot_of[H.guid] then slots[#slots + 1] = { guid = H.guid, name = H.name }; slot_of[H.guid] = #slots end
+      if I.midi then slots[slot_of[H.guid]].midi = true end         -- MIDI slots stay on the original track
     end
     local members = {}
     for k, I in ipairs(sel) do
-      members[k] = { mid = k, slot = slot_of[I.T.guid], rel = I.pos - P0, len = I.len, soffs = I.soffs, rate = I.rate,
+      members[k] = { mid = k, slot = slot_of[self:home(info.W, I.T).guid], rel = I.pos - P0, len = I.len, soffs = I.soffs, rate = I.rate,
                      pitch = I.pitch, tvol = I.tvol, vol = I.vol, mute = I.mute, fin = I.fin, fout = I.fout,
-                     file = I.file, midi = I.midi, chunk = RA.item_chunk(I.ptr), stats = stats[k] }
+                     file = I.file, midi = I.midi, chunk = RA.item_chunk(I.ptr), stats = stats[k], color = I.color }
     end
     local base = (name and name:match("%S")) and name:gsub("^%s+", ""):gsub("%s+$", "")
                  or ((sel[1].tname ~= "" and sel[1].tname:gsub("%.%w+$", "")) or ("Idea " .. cid))
@@ -876,6 +946,45 @@ function App:stash(name, mode)
 end
 
 -- a new linked placement. where: "cursor" (original tracks) | "selected" (slot 1 on the selected track) | "origin"
+-- the track that carries slot k's items for this placement: the owner itself, or (option) its sub-lane.
+-- MIDI slots always stay on the original track: a child track cannot reach the parent's instrument.
+local SUB_RGB = { 0x85, 0x42, 0xFA }
+function App:ensure_sublane(owner_guid)
+  local W = RA.scan()
+  local owner = W.by_guid[owner_guid]
+  if not owner then return owner_guid end
+  local tag = "sub:" .. owner_guid
+  for _, T in ipairs(W.tracks) do if T.lane == tag then return T.guid end end
+  local new_owner, child = C.sublane_insert(owner.depth)
+  local tr, guid = RA.insert_track(owner.i, "-> " .. owner.name .. " (ideas)", r.ColorToNative(SUB_RGB[1], SUB_RGB[2], SUB_RGB[3]))
+  RA.set_depth(owner.ptr, new_owner)
+  RA.set_depth(tr, child)
+  RA.set_track_tag(tr, "lane", tag)
+  return guid
+end
+
+-- empty sub-lanes that no placement refers to go away; the folder depths are put back
+function App:cleanup_sublanes()
+  local M = self:build(RA.scan())
+  if next(M.sub) == nil then return end
+  local refs = {}
+  for _, cid in ipairs(M.order) do
+    local G = M.cards[cid]
+    for _, pid in ipairs(G.order) do for _, g in ipairs(G.inst[pid].map) do refs[g] = true end end
+  end
+  local doomed = {}
+  for _, T in pairs(M.sub) do if #T.items == 0 and not refs[T.guid] then doomed[#doomed + 1] = T end end
+  table.sort(doomed, function(a, b) return a.i > b.i end)
+  for _, T in ipairs(doomed) do
+    local prev = M.W.tracks[T.i - 1]
+    RA.touch()
+    if prev and T.depth < 0 then RA.set_depth(prev.ptr, C.depth_after_removal(prev.depth, T.depth)) end
+    RA.set_depth(T.ptr, 0)
+    RA.delete_track(T.ptr)
+  end
+end
+
+-- a new linked placement. where: "cursor" (original tracks) | "selected" (first track on the selected track) | "origin"
 function App:place(cid, where)
   local W = RA.scan()
   local sel_tracks = RA.selected_tracks()
@@ -887,35 +996,117 @@ function App:place(cid, where)
     local def = card.variants[card.active]
     local len = C.def_extent(def)
     local pos = (where == "origin") and (card.origin or W.cursor) or W.cursor
-    local map = {}
+    -- owners: slot k -> the real track it belongs to (lanes are not counted when tracks are mapped by distance)
+    local real, ridx = {}, {}
+    for _, T in ipairs(W.tracks) do if T.lane == "" then real[#real + 1] = T; ridx[T.guid] = #real end end
+    local owners = {}
     if where == "selected" then
-      local target = RA.track_index0(sel_tracks[1]) + 1
+      local home = self:home(W, W.by_guid[RA.track_guid(sel_tracks[1])] or W.tracks[1])
       local origin = {}
-      for k, s in ipairs(card.slots) do local T = W.by_guid[s.guid]; origin[k] = T and T.i end
-      for k, idx in ipairs(C.map_slots(origin, target, #W.tracks, #card.slots)) do map[k] = W.tracks[idx].guid end
-      card.map = map                                 -- copies of placements use the last mapping
+      for k, s in ipairs(card.slots) do origin[k] = ridx[s.guid] end
+      for k, idx in ipairs(C.map_slots(origin, ridx[home.guid] or 1, #real, #card.slots)) do owners[k] = real[idx].guid end
+    else
+      for k, s in ipairs(card.slots) do owners[k] = s.guid end
     end
-    if where ~= "selected" then card.map = full_map(card, nil) end
+    local map = {}
+    for k, s in ipairs(card.slots) do
+      map[k] = (self.cfg.sub_lanes and not s.midi) and self:ensure_sublane(owners[k]) or owners[k]
+    end
+    card.map = full_map(card, map)                  -- copies of placements use the last mapping
     self:new_alias(M, G, pos, len, "", map)
-    local P = G.inst[G.order[#G.order]]
-    RA.set_item_tag(P.item.ptr, "inst", cid .. "|" .. P.pid)
-    RA.set_item_tag(P.item.ptr, "map", table.concat(P.map, ","))
-    RA.set_item_tag(P.item.ptr, "var", card.active)
     return true
   end)
 end
 
--- audition in context: a marker named like the card at the edit cursor (the sync puts an audition placement there)
-function App:audition(cid, play)
-  local W = RA.scan()
-  local c = self:card_view(cid)
-  if not c then return end
-  RA.with_undo("IdeaPool: audition idea", function()
-    RA.add_marker(W.cursor, (self.cfg.marker_prefix ~= "" and (self.cfg.marker_prefix .. " ") or "") .. c.name)
+---------------------------------------------------------------------------------------------------------- solo audition
+-- Temporary tracks (one per original track, with its FX chain), the idea placed on them as an ordinary placement,
+-- everything else un-soloed, a loop over the idea, play. When playback stops everything is removed again.
+-- Syncs and A/B switches work as for any placement; no undo points are made.
+function App:silent(fn)
+  RA.begin_writes("none")
+  local ok, err = pcall(fn)
+  RA.end_writes()
+  if not ok then error(err, 0) end
+end
+
+function App:audition(cid)
+  cid = tostring(cid)
+  if self.aud then self:stop_audition() end
+  local M0 = self:build(RA.scan())
+  local G0 = M0.cards[cid]
+  if not G0 or not M0.lane then self.msg = "Nothing to audition."; return false end
+  local W = M0.W
+  local card = G0.card
+  local def = card.variants[card.active]
+  local len = math.max(C.def_extent(def), 0.05)
+  local pos = W.cursor
+  local aud = { cid = cid, solo = {}, t0 = r.time_precise(), pos = pos, len = len }
+  for _, T in ipairs(W.tracks) do aud.solo[T.guid] = T.solo end
+  local ok, err = pcall(function()
+    self:silent(function()
+      local map = {}
+      for k, s in ipairs(card.slots) do
+        local tr, guid = RA.insert_track(RA.track_count(), "IdeaPool audition: " .. s.name, r.ColorToNative(SUB_RGB[1], SUB_RGB[2], SUB_RGB[3]))
+        RA.set_track_tag(tr, "lane", "audition")
+        local owner = W.by_guid[s.guid]
+        if self.cfg.audition_fx and owner then
+          local blk = RA.track_fxchain(owner.ptr)
+          if blk then RA.add_fxchain(tr, blk) end
+        end
+        map[k] = guid
+      end
+      for _, T in ipairs(W.tracks) do if T.solo ~= 0 then RA.set_solo(T.ptr, 0) end end
+      local W2 = RA.scan()
+      for _, g in ipairs(map) do local T = W2.by_guid[g]; if T then RA.set_solo(T.ptr, 2) end end
+      local M = self:build(W2)
+      local P = self:new_alias(M, M.cards[cid], pos, len, "t", map)
+      aud.pid = P.pid
+      self.aud = aud                                   -- from now on the placement is expected (not a leftover)
+      RA.set_track_tag(M.lane.ptr, "pool", C.json_encode(M.pool))
+    end)
     self:sync(false, "none")
   end)
-  if play then RA.play_from(W.cursor) end
+  if not ok then
+    self.aud = aud
+    pcall(self.stop_audition, self)
+    self.err = "Audition failed: " .. tostring(err)
+    return false
+  end
+  if self.cfg.audition_loop then aud.loop = RA.loop_save(); RA.loop_set(pos, pos + len) end
+  RA.play_from(pos)
+  aud.t0 = r.time_precise()
+  return true
 end
+
+function App:stop_audition()
+  local aud = self.aud
+  if not aud then return end
+  self.aud = nil
+  if RA.is_playing() then RA.stop() end
+  if aud.loop then RA.loop_restore(aud.loop) end
+  local ok, err = pcall(function()
+    self:silent(function()
+      local M = self:build(RA.scan())
+      local G = M.cards[aud.cid]
+      local P = G and G.inst[aud.pid]
+      if P then
+        for _, mem in pairs(P.members) do RA.delete_item(mem.I.ptr) end
+        RA.delete_item(P.item.ptr)
+      end
+      local W = RA.scan()                              -- items first, tracks last: no pointer is used after its track is gone
+      for _, T in ipairs(W.tracks) do if T.lane == "audition" then RA.delete_track(T.ptr) end end
+      local W3 = RA.scan()
+      for guid, v in pairs(aud.solo) do
+        local T = W3.by_guid[guid]
+        if T and T.solo ~= v then RA.set_solo(T.ptr, v) end
+      end
+    end)
+  end)
+  if not ok then self.err = "Audition cleanup failed: " .. tostring(err) end
+  self:refresh()
+end
+
+function App:shutdown() self:stop_audition() end
 
 function App:find(cid, pid)
   local M = self:build(RA.scan())
@@ -923,15 +1114,13 @@ function App:find(cid, pid)
   return M, G, G and G.inst[tostring(pid)]
 end
 
--- audition -> ordinary linked placement; its marker is renamed so it no longer auditions
-function App:commit(cid, pid)
+-- marker placement -> ordinary linked placement: it stays, the marker is removed (it would place the idea again)
+function App:keep(cid, pid)
   local M, G, P = self:find(cid, pid)
-  if not P or not is_audition(P) then return end
+  if not P or not is_marker(P) then return end
   local key = P.mode:sub(3)
-  RA.with_undo("IdeaPool: commit audition", function()
-    for _, mk in ipairs(M.W.markers) do
-      if mk.key == key then RA.rename_marker(mk, "(placed) " .. mk.name) end
-    end
+  RA.with_undo("IdeaPool: keep marker placement", function()
+    for _, mk in ipairs(M.W.markers) do if mk.key == key then RA.delete_marker(mk) end end
     RA.set_item_tag(P.item.ptr, "mode", "")
     self:sync(false, "none")
   end)
@@ -939,7 +1128,7 @@ end
 
 function App:freeze(cid, pid, on)
   local M, G, P = self:find(cid, pid)
-  if not P or is_audition(P) then return end
+  if not P or driven(P) then return end
   -- unfreezing = the placement shows the card again; what it looked like while frozen is replaced
   -- (use "Save as variant" first to keep it)
   RA.with_undo(on and "IdeaPool: freeze placement" or "IdeaPool: unfreeze placement", function()
@@ -949,15 +1138,15 @@ function App:freeze(cid, pid, on)
   end)
 end
 
--- members become plain items, the placement is removed (auditions: the marker is renamed too)
+-- members become plain items, the placement is removed (a marker placement: its marker goes too)
 function App:detach(cid, pid)
   local M, G, P = self:find(cid, pid)
   if not P then return end
   RA.with_undo("IdeaPool: detach placement", function()
     for _, mem in pairs(P.members) do RA.set_item_tag(mem.I.ptr, "mem", ""); RA.set_item_tag(mem.I.ptr, "app", "") end
-    if is_audition(P) then
+    if is_marker(P) then
       local key = P.mode:sub(3)
-      for _, mk in ipairs(M.W.markers) do if mk.key == key then RA.rename_marker(mk, "(placed) " .. mk.name) end end
+      for _, mk in ipairs(M.W.markers) do if mk.key == key then RA.delete_marker(mk) end end
     end
     RA.delete_item(P.item.ptr)
     self:sync(false, "none")
@@ -988,7 +1177,8 @@ function App:save_variant(cid, pid)
       local slot = slot_of[I.T.guid] or (old and old.slot) or 1
       members[#members + 1] = {
         mid = mid, slot = slot, rel = I.pos - P.W.pos + P.W.offs, len = I.len, soffs = I.soffs, rate = I.rate,
-        pitch = I.pitch, tvol = I.tvol, vol = I.vol / (G.factor[P.def] or 1), mute = I.mute, fin = I.fin, fout = I.fout,
+        pitch = I.pitch, tvol = I.tvol, vol = I.midi and I.vol or I.vol / (G.factor[P.def] or 1), mute = I.mute,
+        fin = I.fin, fout = I.fout, color = old and old.color,
         file = I.file, midi = I.midi, chunk = RA.item_chunk(I.ptr), stats = measured[mid] or (old and old.stats) }
     end
     table.sort(members, function(a, b) return a.mid < b.mid end)
@@ -1087,19 +1277,25 @@ function App:rename(cid, name)
     if not G then return end
     local others = {}
     for k, c in pairs(M.pool.cards) do if k ~= G.cid then others[k] = c end end
+    local old = C.norm_name(G.card.name)
     G.card.name = self:unique_name({ cards = others }, name)
+    -- markers that placed this idea follow its new name
+    for _, mk in ipairs(M.W.markers) do
+      if C.norm_name(mk.name) == old and M.by_name[old] == G.cid then RA.rename_marker(mk, G.card.name) end
+    end
   end)
 end
 
 -- the card leaves the pool; its placements become plain items (auditions are removed)
 function App:delete_card(cid)
+  if self.aud and self.aud.cid == tostring(cid) then self:stop_audition() end
   self:edit("delete idea", function(M)
     local G = M.cards[tostring(cid)]
     if not G then return end
     for _, pid in ipairs(G.order) do
       local P = G.inst[pid]
       for _, mem in pairs(P.members) do
-        if is_audition(P) then RA.delete_item(mem.I.ptr)
+        if driven(P) then RA.delete_item(mem.I.ptr)
         else RA.set_item_tag(mem.I.ptr, "mem", ""); RA.set_item_tag(mem.I.ptr, "app", "") end
       end
       RA.delete_item(P.item.ptr)
@@ -1150,7 +1346,7 @@ function App:detach_all()
       if T.lane ~= "" then RA.set_track_tag(T.ptr, "lane", ""); RA.set_track_tag(T.ptr, "pool", "") end
     end
     for _, I in ipairs(W.items) do
-      if I.tag_i ~= "" then for _, k in ipairs({ "inst", "win", "has", "map", "mode", "var" }) do RA.set_item_tag(I.ptr, k, "") end end
+      if I.tag_i ~= "" then for _, k in ipairs({ "inst", "win", "has", "map", "mode", "var", "col" }) do RA.set_item_tag(I.ptr, k, "") end end
       if I.tag_m ~= "" then RA.set_item_tag(I.ptr, "mem", ""); RA.set_item_tag(I.ptr, "app", "") end
     end
   end)

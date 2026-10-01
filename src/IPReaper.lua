@@ -8,12 +8,13 @@ local C = require("IPCore")
 local RA = {}
 
 RA.TAG = {
-  lane  = "P_EXT:IP_lane",    -- track: "ideas" = the IDEAS lane (holds every placement)
+  lane  = "P_EXT:IP_lane",    -- track: "ideas" = the IDEAS lane | "audition" = temporary track | "sub:<guid>" = sub-lane of that track
   pool  = "P_EXT:IP_pool",    -- IDEAS lane: the pool (JSON: cards, variants, counters)
   inst  = "P_EXT:IP_p",       -- placement (alias item): "<cid>|<pid>"
   win   = "P_EXT:IP_w",       -- placement: last window "pos|len|offs"
   has   = "P_EXT:IP_h",       -- placement: mids materialised "1,2,5"
   map   = "P_EXT:IP_map",     -- placement: track GUID per card slot "{..},{..}"
+  col   = "P_EXT:IP_col",     -- placement: how its items are coloured now: "g" frozen | "i" idea | "o" original
   mode  = "P_EXT:IP_mode",    -- placement: "" (linked) | "frozen" | "m:<isrgn>:<idx>" (audition of a marker)
   var   = "P_EXT:IP_v",       -- placement: variant id it showed last
   mem   = "P_EXT:IP_m",       -- member item: "<cid>|<pid>|<mid>"
@@ -39,7 +40,7 @@ function RA.scan()
     local T = {
       ptr = tr, i = i + 1, guid = r.GetTrackGUID(tr), name = tstr(tr, "P_NAME"),
       depth = math.floor(r.GetMediaTrackInfo_Value(tr, "I_FOLDERDEPTH") + 0.5),
-      lane = tstr(tr, RA.TAG.lane), items = {},
+      lane = tstr(tr, RA.TAG.lane), items = {}, solo = r.GetMediaTrackInfo_Value(tr, "I_SOLO"),
     }
     if T.lane ~= "" then T.pool = tstr(tr, RA.TAG.pool) end
     W.tracks[#W.tracks + 1] = T
@@ -65,12 +66,13 @@ function RA.read_item(it, T)
     pos = gv(it, "D_POSITION"), len = gv(it, "D_LENGTH"),
     vol = gv(it, "D_VOL"), mute = gv(it, "B_MUTE"),
     fin = gv(it, "D_FADEINLEN"), fout = gv(it, "D_FADEOUTLEN"),
-    sel = gv(it, "B_UISEL") ~= 0,
+    sel = gv(it, "B_UISEL") ~= 0, color = gv(it, "I_CUSTOMCOLOR"),
     tag_i = istr(it, RA.TAG.inst), tag_m = istr(it, RA.TAG.mem),
   }
   if I.tag_i ~= "" then
     I.tag_w = istr(it, RA.TAG.win); I.tag_h = istr(it, RA.TAG.has)
     I.tag_map = istr(it, RA.TAG.map); I.tag_mode = istr(it, RA.TAG.mode); I.tag_v = istr(it, RA.TAG.var)
+    I.tag_col = istr(it, RA.TAG.col)
   end
   if I.tag_m ~= "" then I.tag_a = istr(it, RA.TAG.app) end
   local tk = r.GetActiveTake(it)
@@ -349,6 +351,57 @@ function RA.selected_tracks()
   local out = {}
   for i = 0, r.CountSelectedTracks(0) - 1 do out[#out + 1] = r.GetSelectedTrack(0, i) end
   return out
+end
+
+function RA.set_item_color(it, color)
+  local want = (color and color ~= 0) and (color | 0x1000000) or 0
+  if r.GetMediaItemInfo_Value(it, "I_CUSTOMCOLOR") ~= want then r.SetMediaItemInfo_Value(it, "I_CUSTOMCOLOR", want) end
+end
+
+---------------------------------------------------------------------------------------------------------- audition (v0.2.1)
+function RA.track_count() return r.CountTracks(0) end
+function RA.track_guid(tr) return r.GetTrackGUID(tr) end
+function RA.set_solo(tr, v) r.SetMediaTrackInfo_Value(tr, "I_SOLO", v) end
+function RA.is_playing() return (r.GetPlayState() & 3) ~= 0 end            -- playing or paused
+function RA.stop() r.OnStopButton() end
+
+-- the <FXCHAIN ...> block of a track's state chunk (nil when it has none)
+function RA.track_fxchain(tr)
+  local ok, chunk = r.GetTrackStateChunk(tr, "", false)
+  if not ok or not chunk then return nil end
+  local out, depth, on = {}, 0, false
+  for line in (chunk .. "\n"):gmatch("([^\n]*)\n") do
+    local l = line:match("^%s*(.-)%s*$")
+    if not on and l:match("^<FXCHAIN") and not l:match("^<FXCHAIN_REC") then on = true end
+    if on then
+      out[#out + 1] = line
+      if l:sub(1, 1) == "<" then depth = depth + 1 elseif l == ">" then depth = depth - 1 end
+      if depth == 0 then break end
+    end
+  end
+  if #out == 0 then return nil end
+  return table.concat(out, "\n")
+end
+
+-- puts an FXCHAIN block (with fresh FX GUIDs) into a fresh track
+function RA.add_fxchain(tr, block)
+  local ok, chunk = r.GetTrackStateChunk(tr, "", false)
+  if not ok or not chunk then return false end
+  block = C.refresh_guids(block, RA.gen_guid, false)
+  local head = chunk:match("^(.*)\n>%s*$")
+  if not head then return false end
+  return r.SetTrackStateChunk(tr, head .. "\n" .. block .. "\n>", false)
+end
+
+-- loop points + repeat, so they can be put back after an audition
+function RA.loop_save()
+  local s, e = r.GetSet_LoopTimeRange(false, true, 0, 0, false)
+  return { s = s, e = e, repeating = r.GetSetRepeat(-1) }
+end
+function RA.loop_set(s, e) r.GetSet_LoopTimeRange(true, true, s, e, false); r.GetSetRepeat(1) end
+function RA.loop_restore(sv)
+  r.GetSet_LoopTimeRange(true, true, sv.s, sv.e, false)
+  r.GetSetRepeat(sv.repeating)
 end
 
 function RA.select_only(items)

@@ -229,6 +229,22 @@ function M.install()
     return got
   end
   R.GetPlayState = function() return S.playing and 1 or 0 end
+  R.OnStopButton = function() S.playing = false end
+  S.repeat_on, S.loop = 0, { 0, 0 }
+  R.GetSetRepeat = function(v) if v >= 0 then S.repeat_on = v end return S.repeat_on end
+  R.GetSet_LoopTimeRange = function(set, _, s, e)
+    if set then S.loop = { s, e } end
+    return S.loop[1], S.loop[2]
+  end
+  -- track chunks: only the FX chain matters to us (T.fxchain = the text of an <FXCHAIN ...> block)
+  R.GetTrackStateChunk = function(t)
+    return true, "<TRACK\nNAME \"" .. t.name .. "\"\nMAINSEND 1 0" .. (t.fxchain and ("\n" .. t.fxchain) or "") .. "\n>"
+  end
+  R.SetTrackStateChunk = function(t, chunk)
+    local blk = chunk:match("(<FXCHAIN.-\n>)\n>%s*$")
+    t.fxchain = blk
+    bump(); return true
+  end
   R.GetPlayPosition2 = function() return S.play_pos or 0 end
   R.Master_GetTempo = function() return S.tempo or 120 end
   R.TimeMap2_GetDividedBpmAtTime = function() return S.tempo or 120 end
@@ -246,10 +262,12 @@ function M.install()
     if k == "I_FOLDERDEPTH" then return t.depth end
     if k == "IP_TRACKNUMBER" then return tidx(t) or 0 end
     if k == "I_CUSTOMCOLOR" then return t.color end
+    if k == "I_SOLO" then return t.solo or 0 end
     error("track value " .. k)
   end
   R.SetMediaTrackInfo_Value = function(t, k, v)
-    if k == "I_FOLDERDEPTH" then t.depth = v elseif k == "I_CUSTOMCOLOR" then t.color = v else error("set track " .. k) end
+    if k == "I_FOLDERDEPTH" then t.depth = v elseif k == "I_CUSTOMCOLOR" then t.color = v
+    elseif k == "I_SOLO" then t.solo = v else error("set track " .. k) end
     bump()
   end
   R.GetSetMediaTrackInfo_String = function(t, k, v, set)

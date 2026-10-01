@@ -41,6 +41,7 @@ local app = App.new()
 local ui = UI.new(app)
 
 local function shutdown()
+  pcall(app.shutdown, app)                 -- a running solo audition is cleaned up
   app:save()
   set_toggle(false)
   r.SetExtState(EXT, "running", "0", false)
